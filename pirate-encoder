@@ -1,0 +1,29 @@
+#!/bin/bash
+
+input="$1"
+legenda="${input%.*}.srt"
+output="${input%.*}_REENCODED.mkv"
+
+# Inicializa as variáveis de controle
+extra_args=()
+map_args=("-map" "0:v:0" "-map" "0:a:0")
+
+if [ -f "$legenda" ]; then
+    echo "✅ Legenda encontrada (ISO-8859-1): $legenda"
+    # Adiciona a legenda como segundo input e define o mapeamento dela
+    extra_args+=("-sub_charenc" "iso-8859-1" "-i" "$legenda")
+    map_args+=("-map" "1:s:0" "-c:s" "srt")
+else
+    echo "⚠️ Nenhuma legenda .srt encontrada. Prosseguindo apenas com vídeo/áudio."
+fi
+
+ffmpeg -vaapi_device /dev/dri/renderD128 \
+-analyzeduration 100M -probesize 100M \
+-i "$input" "${extra_args[@]}" \
+-vf "format=p010,hwupload" \
+-c:v hevc_vaapi -profile:v main10 \
+-rc_mode VBR -b:v 6.5M -maxrate:v 10M -bufsize:v 13M \
+"${map_args[@]}" \
+-c:a eac3 -b:a 448k \
+"$output"
+
