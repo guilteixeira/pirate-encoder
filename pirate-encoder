@@ -48,8 +48,13 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-# --- Extração de Metadados HDR ---
-echo "🔍 Analisando HDR..."
+# --- Extração de Metadados HDR e Duração ---
+echo "🔍 Analisando mídia..."
+# Pega duração total para a porcentagem
+DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input")
+TOTAL_SECONDS=${DURATION%.*}
+
+# Pega dados de HDR
 COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" | tr -d '[:space:]')
 
 HDR_OPTS=""
@@ -82,15 +87,14 @@ if [ -f "$legenda" ]; then
     map_args+=("-map" "1:s:0")
 fi
 
+# --- Execução com Porcentagem e Status ---
 echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
-
-# --- Execução do FFmpeg ---
-echo "⏳ Processando... (Acompanhe o progresso abaixo)"
+echo "⏱️  Duração: $((TOTAL_SECONDS / 60)) min | Espera est.: ~$((TOTAL_SECONDS / 60 / 3)) min"
 echo "--------------------------------------------------"
 
+# Usamos stdbuf para evitar que o buffer do pipe esconda o progresso
 ffmpeg -loglevel error -stats \
     $VAAPI_DEV \
-    -analyzeduration 100M -probesize 100M \
     -i "$input" "${extra_args[@]}" \
     "${map_args[@]}" \
     -vf "$VF_OPTS" \
@@ -103,8 +107,20 @@ ffmpeg -loglevel error -stats \
     $HDR_OPTS \
     -c:a copy \
     -c:s srt \
-    -y "$output"
+    -y "$output" 2>&1 | while read -d $'\r' -r line; do
+    
+    if [[ "$line" =~ time=([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+        TIME_STR="${BASH_REMATCH[1]}"
+        IFS=: read -r h m s <<< "$TIME_STR"
+        # Força base 10 para evitar erro de octal (08, 09 segundos)
+        CURRENT_SECONDS=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+        
+        if [[ -n "$TOTAL_SECONDS" && "$TOTAL_SECONDS" -gt 0 ]]; then
+            PERCENT=$(echo "scale=1; ($CURRENT_SECONDS * 100) / $TOTAL_SECONDS" | bc)
+            printf "\r\033[K%s [ %s%% ]" "$line" "$PERCENT"
+        fi
+    fi
+done
 
 echo -e "\n--------------------------------------------------"
-echo "✅ Concluído com sucesso!"
-echo "📂 Arquivo: $output"
+echo "✅ Concluído!"
