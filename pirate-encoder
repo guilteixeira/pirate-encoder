@@ -1,7 +1,6 @@
 #!/bin/bash
 
 input="$1"
-# Verifica se o arquivo de entrada existe
 if [ ! -f "$input" ]; then
     echo "❌ Erro: Arquivo '$input' não encontrado."
     exit 1
@@ -11,118 +10,79 @@ shift
 
 # Detecta o Sistema Operacional
 OS="$(uname -s)"
-
 case "${OS}" in
     Linux)
-        echo "🐧 Sistema: Linux (Usando VAAPI/AMD)"
+        echo "🐧 Sistema: Linux (VAAPI)"
         ENC_V="hevc_vaapi"
         VF_OPTS="format=p010,hwupload"
         VAAPI_DEV="-vaapi_device /dev/dri/renderD128"
-        RC_OPTS="-rc_mode VBR" # Específico do VAAPI
+        RC_OPTS="-rc_mode VBR"
         ;;
     Darwin)
-        echo "🍎 Sistema: macOS (Usando VideoToolbox)"
+        echo "🍎 Sistema: macOS (VideoToolbox)"
         ENC_V="hevc_videotoolbox"
         VF_OPTS="format=p010"
         VAAPI_DEV=""
-        RC_OPTS="" # VideoToolbox gerencia o VBR nativamente sem essa flag
+        RC_OPTS=""
         ;;
     *)
-        echo "❌ Sistema não suportado: ${OS}"
+        echo "❌ Sistema não suportado"
         exit 1
         ;;
 esac
 
-# Função para exibir erro e como usar
-usage() {
-    echo -e "\n❌ Erro: Parâmetro inválido!"
-    echo -e "Uso correto: $0 arquivo.mkv [--tune anime|action|cult]\n"
-    exit 1
-}
+# Valores padrão
+B_RATE="6.5M"; MAX_R="10M"; BUF="13M"; TUNE_NAME="normal"
 
-# --- Extração de Metadados HDR e Espaço de Cor ---
-echo "🔍 Analisando cores e HDR do original..."
+# Processa os parâmetros --tune
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --tune)
+            case $2 in
+                anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; TUNE_NAME="anime" ;;
+                action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; TUNE_NAME="action" ;;
+                cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; TUNE_NAME="cult" ;;
+            esac
+            shift 2 ;;
+        *) shift ;;
+    esac
+done
 
-# Lê a curva de transferência (smpte2084 = HDR10 / arib-std-b67 = HLG)
+# --- Extração de Metadados HDR ---
+echo "🔍 Analisando HDR..."
 COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" | tr -d '[:space:]')
 
 HDR_OPTS=""
 if [ "$COLOR_TRC" == "smpte2084" ]; then
-    echo "✨ HDR Real Detectado (Curva PQ). Forçando tags BT.2020..."
-    
-    # Isso é o que obriga a LG C4 a acender a logo "HDR":
+    echo "✨ HDR10 Detectado."
     HDR_OPTS="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
-
-    # Tenta extrair MaxCLL e MaxFALL para ajuste fino de brilho
+    
     HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input")
     MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
     MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
 
     if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
-        echo "   ↳ Metadados de brilho: MaxCLL=$MAX_CLL, MaxFALL=$MAX_FALL"
         HDR_OPTS="$HDR_OPTS -metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
     fi
-else
-    echo "📺 Vídeo SDR detectado. Nenhuma injeção necessária."
 fi
-
-# Valores padrão (Preset Normal)
-B_RATE="6.5M"; MAX_R="10M"; BUF="13M"; PERFIL="normal"
-
-# Processa os parâmetros
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --tune)
-            case $2 in
-                anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; PERFIL="anime" ;;
-                action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; PERFIL="action" ;;
-                cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; PERFIL="cult" ;;
-                *)      usage ;;
-            esac
-            shift 2 # Pula o --tune e o valor
-            ;;
-        *)
-            usage # Argumento desconhecido
-            ;;
-    esac
-done
 
 legenda="${input%.*}.srt"
 output="${input%.*} - REENCODED.mkv"
 
-echo "🚀 Iniciando encode: $input"
-echo "🎨 Tune selecionado: $PERFIL (Bitrate: $B_RATE)"
-
-# --- Extração de Metadados HDR ---
-HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input")
-MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
-MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
-
-HDR_OPTS=""
-if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
-    echo "✨ HDR Detectado: MaxCLL=$MAX_CLL, MaxFALL=$MAX_FALL"
-    HDR_OPTS="-metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
-fi
-
 # --- Configuração de Legenda e Mapas ---
 extra_args=()
-# Começamos mapeando o vídeo 0 e TODOS os áudios do arquivo 0
 map_args=("-map" "0:v:0" "-map" "0:a")
 
 if [ -f "$legenda" ]; then
-    # Detecta a codificação da legenda
     ENCODING=$(file -b --mime-encoding "$legenda")
-    echo "✅ Legenda externa detectada. Codificação original: $ENCODING"
-    
     if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
         ENCODING="iso-8859-1"
     fi
-
-    # Adiciona o arquivo de legenda como SEGUNDO input (-i)
     extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
-    # Mapeia a legenda do segundo input (índice 1)
     map_args+=("-map" "1:s:0")
 fi
+
+echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
 
 # --- Execução do FFmpeg ---
 ffmpeg $VAAPI_DEV \
@@ -131,8 +91,11 @@ ffmpeg $VAAPI_DEV \
     "${map_args[@]}" \
     -vf "$VF_OPTS" \
     -c:v "$ENC_V" \
-    -profile:v "$PROFILE" \
-    $RC_OPTS -b:v "$bitrate" \
+    -profile:v main10 \
+    -b:v "$B_RATE" \
+    -maxrate:v "$MAX_R" \
+    -bufsize:v "$BUF" \
+    $RC_OPTS \
     $HDR_OPTS \
     -c:a copy \
     -c:s srt \
