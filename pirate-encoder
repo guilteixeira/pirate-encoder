@@ -1,5 +1,14 @@
 #!/bin/bash
 
+input="$1"
+# Verifica se o arquivo de entrada existe
+if [ ! -f "$input" ]; then
+    echo "❌ Erro: Arquivo '$input' não encontrado."
+    exit 1
+fi
+
+shift
+
 # Detecta o Sistema Operacional
 OS="$(uname -s)"
 
@@ -14,7 +23,7 @@ case "${OS}" in
     Darwin)
         echo "🍎 Sistema: macOS (Usando VideoToolbox)"
         ENC_V="hevc_videotoolbox"
-        VF_OPTS="format=p010,format=vt"
+        VF_OPTS="format=p010"
         VAAPI_DEV=""
         RC_OPTS="" # VideoToolbox gerencia o VBR nativamente sem essa flag
         ;;
@@ -31,14 +40,31 @@ usage() {
     exit 1
 }
 
-input="$1"
-# Verifica se o arquivo de entrada existe
-if [ ! -f "$input" ]; then
-    echo "❌ Erro: Arquivo '$input' não encontrado."
-    exit 1
-fi
+# --- Extração de Metadados HDR e Espaço de Cor ---
+echo "🔍 Analisando cores e HDR do original..."
 
-shift
+# Lê a curva de transferência (smpte2084 = HDR10 / arib-std-b67 = HLG)
+COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" | tr -d '[:space:]')
+
+HDR_OPTS=""
+if [ "$COLOR_TRC" == "smpte2084" ]; then
+    echo "✨ HDR Real Detectado (Curva PQ). Forçando tags BT.2020..."
+    
+    # Isso é o que obriga a LG C4 a acender a logo "HDR":
+    HDR_OPTS="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
+
+    # Tenta extrair MaxCLL e MaxFALL para ajuste fino de brilho
+    HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input")
+    MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+    MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+
+    if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
+        echo "   ↳ Metadados de brilho: MaxCLL=$MAX_CLL, MaxFALL=$MAX_FALL"
+        HDR_OPTS="$HDR_OPTS -metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
+    fi
+else
+    echo "📺 Vídeo SDR detectado. Nenhuma injeção necessária."
+fi
 
 # Valores padrão (Preset Normal)
 B_RATE="6.5M"; MAX_R="10M"; BUF="13M"; PERFIL="normal"
