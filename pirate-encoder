@@ -109,8 +109,16 @@ extra_args=()
 map_args=("-map" "0:v:0" "-map" "0:a:0")
 
 if [ -f "$legenda" ]; then
-    echo "✅ Legenda externa detectada (ISO-8859-1)."
-    extra_args+=("-sub_charenc" "iso-8859-1" "-i" "$legenda")
+    # Detecta a codificação da legenda
+    ENCODING=$(file -b --mime-encoding "$legenda")
+    echo "✅ Legenda externa detectada. Codificação original: $ENCODING"
+    
+    # Se for "unknown" ou "binary", tentamos o padrão, senão usamos a detectada
+    if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
+        ENCODING="iso-8859-1"
+    fi
+
+    extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
     map_args+=("-map" "1:s:0" "-c:s" "srt")
 fi
 
