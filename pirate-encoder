@@ -1,29 +1,77 @@
 #!/bin/bash
 
-input="$1"
-legenda="${input%.*}.srt"
-output="${input%.*}_REENCODED.mkv"
+# Função para exibir erro e como usar
+usage() {
+    echo -e "\n❌ Erro: Parâmetro inválido!"
+    echo -e "Uso correto: $0 arquivo.mkv [--tune anime|action|cult]\n"
+    exit 1
+}
 
-# Inicializa as variáveis de controle
+input="$1"
+# Verifica se o arquivo de entrada existe
+if [ ! -f "$input" ]; then
+    echo "❌ Erro: Arquivo '$input' não encontrado."
+    exit 1
+fi
+
+shift
+
+# Valores padrão (Preset Normal)
+B_RATE="6.5M"; MAX_R="10M"; BUF="13M"; PERFIL="normal"
+
+# Processa os parâmetros
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --tune)
+            case $2 in
+                anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; PERFIL="anime" ;;
+                action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; PERFIL="action" ;;
+                cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; PERFIL="cult" ;;
+                *)      usage ;; # Se o valor do tune for inválido (ex: --tune teste)
+            esac
+            shift 2 # Pula o --tune e o valor
+            ;;
+        *)
+            usage # Se houver qualquer argumento sobrando que não seja reconhecido
+            ;;
+    esac
+done
+
+legenda="${input%.*}.srt"
+output="${input%.*} - REENCODED.mkv"
+
+echo "🚀 Iniciando encode: $input"
+echo "🎨 Tune selecionado: $PERFIL (Bitrate: $B_RATE)"
+
+# --- Extração de Metadados HDR ---
+HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input")
+MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+
+HDR_OPTS=""
+if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
+    echo "✨ HDR Detectado: MaxCLL=$MAX_CLL, MaxFALL=$MAX_FALL"
+    HDR_OPTS="-metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
+fi
+
+# --- Legendas e Mapeamento ---
 extra_args=()
 map_args=("-map" "0:v:0" "-map" "0:a:0")
 
 if [ -f "$legenda" ]; then
-    echo "✅ Legenda encontrada (ISO-8859-1): $legenda"
-    # Adiciona a legenda como segundo input e define o mapeamento dela
+    echo "✅ Legenda externa detectada (ISO-8859-1)."
     extra_args+=("-sub_charenc" "iso-8859-1" "-i" "$legenda")
     map_args+=("-map" "1:s:0" "-c:s" "srt")
-else
-    echo "⚠️ Nenhuma legenda .srt encontrada. Prosseguindo apenas com vídeo/áudio."
 fi
 
+# --- Execução do FFmpeg ---
 ffmpeg -vaapi_device /dev/dri/renderD128 \
 -analyzeduration 100M -probesize 100M \
 -i "$input" "${extra_args[@]}" \
 -vf "format=p010,hwupload" \
 -c:v hevc_vaapi -profile:v main10 \
--rc_mode VBR -b:v 6.5M -maxrate:v 10M -bufsize:v 13M \
+-rc_mode VBR -b:v "$B_RATE" -maxrate:v "$MAX_R" -bufsize:v "$BUF" \
+$HDR_OPTS \
 "${map_args[@]}" \
 -c:a eac3 -b:a 448k \
 "$output"
-
