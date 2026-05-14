@@ -104,32 +104,36 @@ if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
     HDR_OPTS="-metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
 fi
 
-# --- Legendas e Mapeamento ---
+# --- Configuração de Legenda e Mapas ---
 extra_args=()
-map_args=("-map" "0:v:0" "-map" "0:a:0")
+# Começamos mapeando o vídeo 0 e TODOS os áudios do arquivo 0
+map_args=("-map" "0:v:0" "-map" "0:a")
 
 if [ -f "$legenda" ]; then
     # Detecta a codificação da legenda
     ENCODING=$(file -b --mime-encoding "$legenda")
     echo "✅ Legenda externa detectada. Codificação original: $ENCODING"
     
-    # Se for "unknown" ou "binary", tentamos o padrão, senão usamos a detectada
     if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
         ENCODING="iso-8859-1"
     fi
 
+    # Adiciona o arquivo de legenda como SEGUNDO input (-i)
     extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
-    map_args+=("-map" "1:s:0" "-c:s" "srt")
+    # Mapeia a legenda do segundo input (índice 1)
+    map_args+=("-map" "1:s:0")
 fi
 
 # --- Execução do FFmpeg ---
 ffmpeg $VAAPI_DEV \
--analyzeduration 100M -probesize 100M \
--i "$input" "${extra_args[@]}" \
--vf "$VF_OPTS" \
--c:v "$ENC_V" -profile:v main10 \
-$RC_OPTS -b:v "$B_RATE" -maxrate:v "$MAX_R" -bufsize:v "$BUF" \
-$HDR_OPTS \
-"${map_args[@]}" \
--c:a eac3 -b:a 448k \
-"$output"
+    -analyzeduration 100M -probesize 100M \
+    -i "$input" "${extra_args[@]}" \
+    "${map_args[@]}" \
+    -vf "$VF_OPTS" \
+    -c:v "$ENC_V" \
+    -profile:v "$PROFILE" \
+    $RC_OPTS -b:v "$bitrate" \
+    $HDR_OPTS \
+    -c:a copy \
+    -c:s srt \
+    -y "$output"
