@@ -1,5 +1,29 @@
 #!/bin/bash
 
+# Detecta o Sistema Operacional
+OS="$(uname -s)"
+
+case "${OS}" in
+    Linux)
+        echo "🐧 Sistema: Linux (Usando VAAPI/AMD)"
+        ENC_V="hevc_vaapi"
+        VF_OPTS="format=p010,hwupload"
+        VAAPI_DEV="-vaapi_device /dev/dri/renderD128"
+        RC_OPTS="-rc_mode VBR" # Específico do VAAPI
+        ;;
+    Darwin)
+        echo "🍎 Sistema: macOS (Usando VideoToolbox)"
+        ENC_V="hevc_videotoolbox"
+        VF_OPTS="format=p010,format=vt"
+        VAAPI_DEV=""
+        RC_OPTS="" # VideoToolbox gerencia o VBR nativamente sem essa flag
+        ;;
+    *)
+        echo "❌ Sistema não suportado: ${OS}"
+        exit 1
+        ;;
+esac
+
 # Função para exibir erro e como usar
 usage() {
     echo -e "\n❌ Erro: Parâmetro inválido!"
@@ -27,12 +51,12 @@ while [[ "$#" -gt 0 ]]; do
                 anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; PERFIL="anime" ;;
                 action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; PERFIL="action" ;;
                 cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; PERFIL="cult" ;;
-                *)      usage ;; # Se o valor do tune for inválido (ex: --tune teste)
+                *)      usage ;;
             esac
             shift 2 # Pula o --tune e o valor
             ;;
         *)
-            usage # Se houver qualquer argumento sobrando que não seja reconhecido
+            usage # Argumento desconhecido
             ;;
     esac
 done
@@ -65,12 +89,12 @@ if [ -f "$legenda" ]; then
 fi
 
 # --- Execução do FFmpeg ---
-ffmpeg -vaapi_device /dev/dri/renderD128 \
+ffmpeg $VAAPI_DEV \
 -analyzeduration 100M -probesize 100M \
 -i "$input" "${extra_args[@]}" \
--vf "format=p010,hwupload" \
--c:v hevc_vaapi -profile:v main10 \
--rc_mode VBR -b:v "$B_RATE" -maxrate:v "$MAX_R" -bufsize:v "$BUF" \
+-vf "$VF_OPTS" \
+-c:v "$ENC_V" -profile:v main10 \
+$RC_OPTS -b:v "$B_RATE" -maxrate:v "$MAX_R" -bufsize:v "$BUF" \
 $HDR_OPTS \
 "${map_args[@]}" \
 -c:a eac3 -b:a 448k \
