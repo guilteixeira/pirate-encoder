@@ -85,7 +85,11 @@ fi
 echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
 
 # --- Execução do FFmpeg ---
-ffmpeg $VAAPI_DEV \
+echo "⏳ Processando... (Acompanhe o progresso abaixo)"
+echo "--------------------------------------------------"
+
+ffmpeg -loglevel error -stats \
+    $VAAPI_DEV \
     -analyzeduration 100M -probesize 100M \
     -i "$input" "${extra_args[@]}" \
     "${map_args[@]}" \
@@ -100,3 +104,7 @@ ffmpeg $VAAPI_DEV \
     -c:a copy \
     -c:s srt \
     -y "$output"
+
+echo -e "\n--------------------------------------------------"
+echo "✅ Concluído com sucesso!"
+echo "📂 Arquivo: $output"
