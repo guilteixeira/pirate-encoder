@@ -1,14 +1,67 @@
 #!/bin/bash
 
-input="$1"
-if [ ! -f "$input" ]; then
-    echo "❌ Erro: Arquivo '$input' não encontrado."
+# --- Validação de Argumentos ---
+if [[ $# -lt 1 ]]; then
+    echo "❌ Uso: $0 [padrão_de_arquivos ou arquivo1 arquivo2...] [--tune anime|action|cult]"
+    echo ""
+    echo "Exemplos:"
+    echo "  $0 '*.mkv'"
+    echo "  $0 *.mkv                    # wildcards sem aspas"
+    echo "  $0 '*.mkv' --tune anime"
+    echo "  $0 '/caminho/para/*.mkv' --tune action"
     exit 1
 fi
 
-shift
+# Coleta argumentos de arquivo (antes de --tune)
+TUNE_NAME="normal"
+B_RATE="6.5M"; MAX_R="10M"; BUF="13M"
+FILES=()
+PARSING_FILES=true
 
-# Detecta o Sistema Operacional
+# Parse dos argumentos
+for arg in "$@"; do
+    if [[ "$arg" == "--tune" ]]; then
+        PARSING_FILES=false
+        continue
+    fi
+    
+    if [[ "$PARSING_FILES" == true ]]; then
+        # Expande wildcard se necessário
+        if [[ "$arg" == *"*"* ]] || [[ "$arg" == *"?"* ]]; then
+            # É um padrão, expande
+            for file in $arg; do
+                # Ignora arquivos que já foram processados
+                if [[ -f "$file" ]] && [[ "$file" != *"REENCODED"* ]]; then
+                    FILES+=("$file")
+                fi
+            done
+        else
+            # É um arquivo direto
+            if [[ -f "$arg" ]] && [[ "$arg" != *"REENCODED"* ]]; then
+                FILES+=("$arg")
+            fi
+        fi
+    else
+        # Processa opções --tune
+        case "$arg" in
+            anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; TUNE_NAME="anime" ;;
+            action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; TUNE_NAME="action" ;;
+            cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; TUNE_NAME="cult" ;;
+        esac
+    fi
+done
+
+# Valida se encontrou arquivos
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    echo "❌ Nenhum arquivo encontrado"
+    exit 1
+fi
+
+echo "✅ Encontrados ${#FILES[@]} arquivo(s) para processar"
+echo "📋 Preset: $TUNE_NAME @ $B_RATE"
+echo ""
+
+# --- Detecta o Sistema Operacional ---
 OS="$(uname -s)"
 case "${OS}" in
     Linux)
@@ -31,96 +84,187 @@ case "${OS}" in
         ;;
 esac
 
-# Valores padrão
-B_RATE="6.5M"; MAX_R="10M"; BUF="13M"; TUNE_NAME="normal"
+# --- Processamento em Fila ---
+TOTAL_FILES=${#FILES[@]}
+CURRENT_FILE=1
+FAILED_FILES=()
+COMPLETED_FILES=()
 
-# Processa os parâmetros --tune
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --tune)
-            case $2 in
-                anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; TUNE_NAME="anime" ;;
-                action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; TUNE_NAME="action" ;;
-                cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; TUNE_NAME="cult" ;;
-            esac
-            shift 2 ;;
-        *) shift ;;
-    esac
-done
-
-# --- Extração de Metadados HDR e Duração ---
-echo "🔍 Analisando mídia..."
-# Pega duração total para a porcentagem
-DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input")
-TOTAL_SECONDS=${DURATION%.*}
-
-# Pega dados de HDR
-COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" | tr -d '[:space:]')
-
-HDR_OPTS=""
-if [ "$COLOR_TRC" == "smpte2084" ]; then
-    echo "✨ HDR10 Detectado."
-    HDR_OPTS="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
-    
-    HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input")
-    MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
-    MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
-
-    if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
-        HDR_OPTS="$HDR_OPTS -metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
+for input in "${FILES[@]}"; do
+    # Validação do arquivo
+    if [ ! -f "$input" ]; then
+        echo "⚠️  [$CURRENT_FILE/$TOTAL_FILES] Ignorado (não é arquivo): $input"
+        ((CURRENT_FILE++))
+        continue
     fi
-fi
 
-legenda="${input%.*}.srt"
-output="${input%.*} - REENCODED.mkv"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "📹 [$CURRENT_FILE/$TOTAL_FILES] Processando: $input"
+    echo "═══════════════════════════════════════════════════════════"
 
-# --- Configuração de Legenda e Mapas ---
-extra_args=()
-map_args=("-map" "0:v:0" "-map" "0:a")
+    # --- Extração de Metadados HDR e Duração ---
+    echo "🔍 Analisando mídia..."
+    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
+    TOTAL_SECONDS=${DURATION%.*}
 
-if [ -f "$legenda" ]; then
-    ENCODING=$(file -b --mime-encoding "$legenda")
-    if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
-        ENCODING="iso-8859-1"
+    # Tratamento caso ffprobe falhe
+    if [[ -z "$TOTAL_SECONDS" || "$TOTAL_SECONDS" == "N/A" ]]; then
+        echo "❌ Erro ao analisar o arquivo: $input"
+        FAILED_FILES+=("$input")
+        ((CURRENT_FILE++))
+        continue
     fi
-    extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
-    map_args+=("-map" "1:s:0")
-fi
 
-# --- Execução com Porcentagem e Status ---
-echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
-echo "⏱️  Duração: $((TOTAL_SECONDS / 60)) min | Espera est.: ~$((TOTAL_SECONDS / 60 / 3)) min"
-echo "--------------------------------------------------"
+    # Pega dados de HDR
+    COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null | tr -d '[:space:]')
 
-# Usamos stdbuf para evitar que o buffer do pipe esconda o progresso
-ffmpeg -loglevel error -stats \
-    $VAAPI_DEV \
-    -i "$input" "${extra_args[@]}" \
-    "${map_args[@]}" \
-    -vf "$VF_OPTS" \
-    -c:v "$ENC_V" \
-    -profile:v main10 \
-    -b:v "$B_RATE" \
-    -maxrate:v "$MAX_R" \
-    -bufsize:v "$BUF" \
-    $RC_OPTS \
-    $HDR_OPTS \
-    -c:a copy \
-    -c:s srt \
-    -y "$output" 2>&1 | while read -d $'\r' -r line; do
-    
-    if [[ "$line" =~ time=([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
-        TIME_STR="${BASH_REMATCH[1]}"
-        IFS=: read -r h m s <<< "$TIME_STR"
-        # Força base 10 para evitar erro de octal (08, 09 segundos)
-        CURRENT_SECONDS=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+    HDR_OPTS=""
+    if [ "$COLOR_TRC" == "smpte2084" ]; then
+        echo "✨ HDR10 Detectado."
+        HDR_OPTS="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
         
-        if [[ -n "$TOTAL_SECONDS" && "$TOTAL_SECONDS" -gt 0 ]]; then
-            PERCENT=$(echo "scale=1; ($CURRENT_SECONDS * 100) / $TOTAL_SECONDS" | bc)
-            printf "\r\033[K%s [ %s%% ]" "$line" "$PERCENT"
+        HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input" 2>/dev/null)
+        MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+        MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
+
+        if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
+            HDR_OPTS="$HDR_OPTS -metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
         fi
     fi
+
+    legenda="${input%.*}.srt"
+    output="${input%.*} - REENCODED.mkv"
+
+    # Verifica se o output já existe
+    if [ -f "$output" ]; then
+        echo "⚠️  Arquivo de saída já existe: $output"
+        read -p "Deseja sobrescrever? (s/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Ss]$ ]]; then
+            echo "⏭️  Pulando arquivo..."
+            ((CURRENT_FILE++))
+            continue
+        fi
+    fi
+
+    # --- Configuração de Legenda e Mapas ---
+    extra_args=()
+    map_args=("-map" "0:v:0" "-map" "0:a")
+
+    if [ -f "$legenda" ]; then
+        ENCODING=$(file -b --mime-encoding "$legenda")
+        if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
+            ENCODING="iso-8859-1"
+        fi
+        extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
+        map_args+=("-map" "1:s:0")
+        echo "🎯 Legenda encontrada: $legenda"
+    fi
+
+    # --- Execução com Porcentagem e Status ---
+    echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
+    echo "⏱️  Duração: $((TOTAL_SECONDS / 60)) min | Espera est.: ~$((TOTAL_SECONDS / 60 / 3)) min"
+    echo "--------------------------------------------------"
+
+    # Executa ffmpeg com output redirecionado para arquivo temporário
+    FFMPEG_OUTPUT=$(mktemp)
+    
+    ffmpeg -loglevel error -stats \
+        $VAAPI_DEV \
+        -i "$input" "${extra_args[@]}" \
+        "${map_args[@]}" \
+        -vf "$VF_OPTS" \
+        -c:v "$ENC_V" \
+        -profile:v main10 \
+        -b:v "$B_RATE" \
+        -maxrate:v "$MAX_R" \
+        -bufsize:v "$BUF" \
+        $RC_OPTS \
+        $HDR_OPTS \
+        -c:a copy \
+        -c:s srt \
+        -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
+    
+    FFMPEG_PID=$!
+    
+    # Monitora o progresso lendo arquivo temporário
+    while kill -0 $FFMPEG_PID 2>/dev/null; do
+        if [ -f "$FFMPEG_OUTPUT" ]; then
+            # Procura pela última linha que contém "time=" em todo o arquivo
+            LAST_LINE=$(grep "time=" "$FFMPEG_OUTPUT" 2>/dev/null | tail -1)
+            
+            if [[ -n "$LAST_LINE" ]]; then
+                # Extrai tempo no formato HH:MM:SS
+                TIME_STR=$(echo "$LAST_LINE" | sed -E 's/.*time=([0-9]{2}:[0-9]{2}:[0-9]{2}).*/\1/')
+                
+                if [[ "$TIME_STR" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+                    IFS=: read -r h m s <<< "$TIME_STR"
+                    CURRENT_SECONDS=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+                    
+                    if [[ -n "$TOTAL_SECONDS" && "$TOTAL_SECONDS" -gt 0 ]]; then
+                        PERCENT=$(echo "scale=1; ($CURRENT_SECONDS * 100) / $TOTAL_SECONDS" | bc)
+                        # Extrai frame e fps compatível com macOS e Linux
+                        FRAME=$(echo "$LAST_LINE" | sed -E 's/.*frame= *([0-9]+).*/\1/')
+                        FPS=$(echo "$LAST_LINE" | sed -E 's/.*fps= *([0-9]+).*/\1/')
+                        printf "\r\033[K⏳ frame=%-6s fps=%-3s [%6.1f%%]" "$FRAME" "$FPS" "$PERCENT"
+                    fi
+                fi
+            fi
+        fi
+        sleep 0.5
+    done
+    
+    # Aguarda o fim do processo
+    wait $FFMPEG_PID
+    FFMPEG_EXIT=$?
+    
+    # Limpeza
+    rm -f "$FFMPEG_OUTPUT"
+
+    # Verifica se o ffmpeg completou com sucesso
+    if [ $FFMPEG_EXIT -eq 0 ]; then
+        echo -e "\n--------------------------------------------------"
+        echo "✅ [$CURRENT_FILE/$TOTAL_FILES] Concluído com sucesso!"
+        COMPLETED_FILES+=("$input")
+    else
+        echo -e "\n--------------------------------------------------"
+        echo "❌ [$CURRENT_FILE/$TOTAL_FILES] Erro durante o encode!"
+        FAILED_FILES+=("$input")
+    fi
+
+    ((CURRENT_FILE++))
 done
 
-echo -e "\n--------------------------------------------------"
-echo "✅ Concluído!"
+# --- Resumo Final ---
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "📊 RESUMO DA FILA"
+echo "═══════════════════════════════════════════════════════════"
+echo "✅ Arquivos concluídos: ${#COMPLETED_FILES[@]}/$TOTAL_FILES"
+
+if [ ${#COMPLETED_FILES[@]} -gt 0 ]; then
+    echo ""
+    echo "Arquivos processados com sucesso:"
+    for file in "${COMPLETED_FILES[@]}"; do
+        echo "  ✓ $file"
+    done
+fi
+
+if [ ${#FAILED_FILES[@]} -gt 0 ]; then
+    echo ""
+    echo "❌ Arquivos com erro (${#FAILED_FILES[@]}):"
+    for file in "${FAILED_FILES[@]}"; do
+        echo "  ✗ $file"
+    done
+fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+
+# Retorna código de erro se houver falhas
+if [ ${#FAILED_FILES[@]} -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
