@@ -30,16 +30,11 @@ for arg in "$@"; do
         if [[ "$arg" == *"*"* ]] || [[ "$arg" == *"?"* ]]; then
             # É um padrão, expande
             for file in $arg; do
-                # Ignora arquivos que já foram processados
-                if [[ -f "$file" ]] && [[ "$file" != *"REENCODED"* ]]; then
-                    FILES+=("$file")
-                fi
+                [[ -f "$file" ]] && FILES+=("$file")
             done
         else
             # É um arquivo direto
-            if [[ -f "$arg" ]] && [[ "$arg" != *"REENCODED"* ]]; then
-                FILES+=("$arg")
-            fi
+            [[ -f "$arg" ]] && FILES+=("$arg")
         fi
     else
         # Processa opções --tune
@@ -134,7 +129,16 @@ for input in "${FILES[@]}"; do
     fi
 
     legenda="${input%.*}.srt"
-    output="${input%.*} - REENCODED.mkv"
+    
+    # Cria diretório output se não existir
+    mkdir -p output
+    
+    # Remove pontos do nome do arquivo (mantendo a extensão)
+    # Ex: filme.2024.1080p.mkv -> filme 2024 1080p.mkv
+    base_name="${input%.*}"  # Remove extensão
+    ext="${input##*.}"       # Pega extensão
+    clean_name="${base_name//./ }"  # Substitui pontos por espaços
+    output="output/${clean_name}.${ext}"
 
     # Verifica se o output já existe
     if [ -f "$output" ]; then
@@ -187,6 +191,7 @@ for input in "${FILES[@]}"; do
         -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
     
     FFMPEG_PID=$!
+    ENCODE_START_TIME=$(date +%s)
     
     # Monitora o progresso lendo arquivo temporário
     while kill -0 $FFMPEG_PID 2>/dev/null; do
@@ -204,10 +209,17 @@ for input in "${FILES[@]}"; do
                     
                     if [[ -n "$TOTAL_SECONDS" && "$TOTAL_SECONDS" -gt 0 ]]; then
                         PERCENT=$(echo "scale=1; ($CURRENT_SECONDS * 100) / $TOTAL_SECONDS" | bc)
+                        
+                        # Calcula tempo decorrido
+                        CURRENT_TIME=$(date +%s)
+                        ELAPSED=$((CURRENT_TIME - ENCODE_START_TIME))
+                        ELAPSED_MIN=$((ELAPSED / 60))
+                        ELAPSED_SEC=$((ELAPSED % 60))
+                        
                         # Extrai frame e fps compatível com macOS e Linux
                         FRAME=$(echo "$LAST_LINE" | sed -E 's/.*frame= *([0-9]+).*/\1/')
                         FPS=$(echo "$LAST_LINE" | sed -E 's/.*fps= *([0-9]+).*/\1/')
-                        printf "\r\033[K⏳ frame=%-6s fps=%-3s [%6.1f%%]" "$FRAME" "$FPS" "$PERCENT"
+                        printf "\r\033[K⏳ %02d:%02d | frame=%-6s fps=%-3s [%6.1f%%]" "$ELAPSED_MIN" "$ELAPSED_SEC" "$FRAME" "$FPS" "$PERCENT"
                     fi
                 fi
             fi
