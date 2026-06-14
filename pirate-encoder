@@ -2,26 +2,33 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [padrão_de_arquivos ou arquivo1 arquivo2...] [--tune anime|action|cult]"
+    echo "❌ Uso: $0 [padrão_de_arquivos ou arquivo1 arquivo2...] [--tune anime|action|cult] [--sub-only]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
     echo "  $0 *.mkv                    # wildcards sem aspas"
     echo "  $0 '*.mkv' --tune anime"
     echo "  $0 '/caminho/para/*.mkv' --tune action"
+    echo "  $0 '*.mkv' --sub-only       # apenas embute legenda, sem re-encode"
     exit 1
 fi
 
-# Coleta argumentos de arquivo (antes de --tune)
+# Coleta argumentos de arquivo (antes de --tune / --sub-only)
 TUNE_NAME="normal"
 B_RATE="6.5M"; MAX_R="10M"; BUF="13M"
 FILES=()
 PARSING_FILES=true
+SUB_ONLY=false
 
 # Parse dos argumentos
 for arg in "$@"; do
     if [[ "$arg" == "--tune" ]]; then
         PARSING_FILES=false
+        continue
+    fi
+
+    if [[ "$arg" == "--sub-only" ]]; then
+        SUB_ONLY=true
         continue
     fi
     
@@ -53,7 +60,11 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
 fi
 
 echo "✅ Encontrados ${#FILES[@]} arquivo(s) para processar"
-echo "📋 Preset: $TUNE_NAME @ $B_RATE"
+if [[ "$SUB_ONLY" == true ]]; then
+    echo "📋 Modo: sub-only (remux, sem re-encode)"
+else
+    echo "📋 Preset: $TUNE_NAME @ $B_RATE"
+fi
 echo ""
 
 # --- Detecta o Sistema Operacional ---
@@ -98,6 +109,77 @@ for input in "${FILES[@]}"; do
     echo "📹 [$CURRENT_FILE/$TOTAL_FILES] Processando: $input"
     echo "═══════════════════════════════════════════════════════════"
 
+    legenda="${input%.*}.srt"
+
+    # Cria diretório output se não existir
+    mkdir -p output
+
+    # Remove pontos do nome do arquivo (mantendo a extensão)
+    # Ex: filme.2024.1080p.mkv -> filme 2024 1080p.mkv
+    base_name="${input%.*}"  # Remove extensão
+    ext="${input##*.}"       # Pega extensão
+    clean_name="${base_name//./ }"  # Substitui pontos por espaços
+    output="output/${clean_name}.${ext}"
+
+    # Verifica se o output já existe
+    if [ -f "$output" ]; then
+        echo "⚠️  Arquivo de saída já existe: $output"
+        read -p "Deseja sobrescrever? (s/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Ss]$ ]]; then
+            echo "⏭️  Pulando arquivo..."
+            ((CURRENT_FILE++))
+            continue
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────
+    # MODO SUB-ONLY: remux sem re-encode, apenas embute legenda
+    # ─────────────────────────────────────────────────────────
+    if [[ "$SUB_ONLY" == true ]]; then
+        if [ ! -f "$legenda" ]; then
+            echo "⚠️  Legenda não encontrada: $legenda — pulando"
+            FAILED_FILES+=("$input")
+            ((CURRENT_FILE++))
+            continue
+        fi
+
+        ENCODING=$(file -b --mime-encoding "$legenda")
+        if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
+            ENCODING="iso-8859-1"
+        fi
+
+        echo "🎯 Legenda: $legenda (encoding: $ENCODING)"
+        echo "🚀 Embutindo legenda (sem re-encode)..."
+        echo "--------------------------------------------------"
+
+        ffmpeg -loglevel error -stats \
+            -i "$input" \
+            -sub_charenc "$ENCODING" -i "$legenda" \
+            -map 0 -map 1:s:0 \
+            -c copy -c:s srt \
+            -y "$output" 2>&1
+
+        FFMPEG_EXIT=$?
+
+        if [ $FFMPEG_EXIT -eq 0 ]; then
+            echo "--------------------------------------------------"
+            echo "✅ [$CURRENT_FILE/$TOTAL_FILES] Legenda embutida com sucesso!"
+            COMPLETED_FILES+=("$input")
+        else
+            echo "--------------------------------------------------"
+            echo "❌ [$CURRENT_FILE/$TOTAL_FILES] Erro ao embutir legenda!"
+            FAILED_FILES+=("$input")
+        fi
+
+        ((CURRENT_FILE++))
+        continue
+    fi
+
+    # ─────────────────────────────────────────────────────────
+    # MODO NORMAL: re-encode HEVC
+    # ─────────────────────────────────────────────────────────
+
     # --- Extração de Metadados HDR e Duração ---
     echo "🔍 Analisando mídia..."
     DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
@@ -125,30 +207,6 @@ for input in "${FILES[@]}"; do
 
         if [ ! -z "$MAX_CLL" ] && [ "$MAX_CLL" != "0" ]; then
             HDR_OPTS="$HDR_OPTS -metadata:s:v:0 max-cll=$MAX_CLL -metadata:s:v:0 max-fall=$MAX_FALL"
-        fi
-    fi
-
-    legenda="${input%.*}.srt"
-    
-    # Cria diretório output se não existir
-    mkdir -p output
-    
-    # Remove pontos do nome do arquivo (mantendo a extensão)
-    # Ex: filme.2024.1080p.mkv -> filme 2024 1080p.mkv
-    base_name="${input%.*}"  # Remove extensão
-    ext="${input##*.}"       # Pega extensão
-    clean_name="${base_name//./ }"  # Substitui pontos por espaços
-    output="output/${clean_name}.${ext}"
-
-    # Verifica se o output já existe
-    if [ -f "$output" ]; then
-        echo "⚠️  Arquivo de saída já existe: $output"
-        read -p "Deseja sobrescrever? (s/n): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-            echo "⏭️  Pulando arquivo..."
-            ((CURRENT_FILE++))
-            continue
         fi
     fi
 
