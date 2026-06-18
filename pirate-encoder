@@ -2,7 +2,7 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--audio-lang LANG] [--audio-index N]"
+    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--audio-lang LANG] [--audio-index N] [--title-from-file] [--title-eng]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
@@ -12,6 +12,8 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 '*.mkv' --sub-only            # apenas embute legenda, sem re-encode"
     echo "  $0 '*.mkv' --audio-lang eng      # mantém só áudio em inglês (por tag)"
     echo "  $0 '*.mkv' --audio-index 4       # mantém só a 5ª faixa de áudio (0-based)"
+    echo "  $0 '*.mkv' --title-from-file     # sobrescreve título dos metadados com o nome do arquivo"
+    echo "  $0 '*.mkv' --title-eng            # extrai título inglês de tags no formato 'Russo / English'"
     echo ""
     echo "  # Inspecionar faixas de áudio:"
     echo "  ffprobe -v error -select_streams a \\"
@@ -27,16 +29,20 @@ FILES=()
 SUB_ONLY=false
 AUDIO_LANG=""    # ex: "eng" → -map 0:a:m:language:eng
 AUDIO_IDX=""     # ex: "4"  → -map 0:a:4  (0-based)
+TITLE_FROM_FILE=false
+TITLE_ENG=false
 NEXT_ARG_FOR=""
 
 # Parse dos argumentos
 for arg in "$@"; do
     # Flags que consomem o próximo token
     case "$arg" in
-        --tune)        NEXT_ARG_FOR="tune";        continue ;;
-        --audio-lang)  NEXT_ARG_FOR="audio-lang";  continue ;;
-        --audio-index) NEXT_ARG_FOR="audio-index"; continue ;;
-        --sub-only)    SUB_ONLY=true;               continue ;;
+        --tune)            NEXT_ARG_FOR="tune";        continue ;;
+        --audio-lang)      NEXT_ARG_FOR="audio-lang";  continue ;;
+        --audio-index)     NEXT_ARG_FOR="audio-index"; continue ;;
+        --sub-only)        SUB_ONLY=true;               continue ;;
+        --title-from-file) TITLE_FROM_FILE=true;        continue ;;
+        --title-eng)        TITLE_ENG=true;               continue ;;
     esac
 
     # Processa o valor do token anterior
@@ -82,6 +88,11 @@ if [[ -n "$AUDIO_LANG" ]]; then
     echo "🔊 Áudio: somente lang=$AUDIO_LANG"
 elif [[ -n "$AUDIO_IDX" ]]; then
     echo "🔊 Áudio: somente índice $AUDIO_IDX (0-based)"
+fi
+if [[ "$TITLE_FROM_FILE" == true ]]; then
+    echo "🏷️  Título: será reescrito pelo nome do arquivo"
+elif [[ "$TITLE_ENG" == true ]]; then
+    echo "🏷️  Título: será extraído da tag existente (parte após ' / ')"
 fi
 echo ""
 
@@ -139,6 +150,25 @@ for input in "${FILES[@]}"; do
     clean_name="${base_name//./ }"  # Substitui pontos por espaços
     output="output/${clean_name}.mkv"
 
+    # Metadado de título (opcional)
+    title_arg=()
+    if [[ "$TITLE_ENG" == true ]]; then
+        CURRENT_TITLE=$(ffprobe -v error -show_entries format_tags=title \
+            -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
+        if [[ "$CURRENT_TITLE" == *" / "* ]]; then
+            EN_TITLE="${CURRENT_TITLE#*/ }"
+            title_arg=("-metadata" "title=${EN_TITLE}")
+            echo "🏷️  Título: '${EN_TITLE}'"
+        else
+            # Fallback: usa o nome do arquivo se não há padrão "X / Y"
+            title_arg=("-metadata" "title=${clean_name}")
+            echo "🏷️  Título (fallback filename): '${clean_name}'"
+        fi
+    elif [[ "$TITLE_FROM_FILE" == true ]]; then
+        title_arg=("-metadata" "title=${clean_name}")
+        echo "🏷️  Título: '${clean_name}'"
+    fi
+
     # Verifica se o output já existe
     if [ -f "$output" ]; then
         echo "⚠️  Arquivo de saída já existe: $output"
@@ -185,6 +215,7 @@ for input in "${FILES[@]}"; do
             -sub_charenc "$ENCODING" -i "$legenda" \
             -map 0:v "${sub_audio_map[@]}" -map 1:s:0 \
             -c copy -c:s srt \
+            "${title_arg[@]}" \
             -y "$output" 2>&1
 
         FFMPEG_EXIT=$?
@@ -281,6 +312,7 @@ for input in "${FILES[@]}"; do
         $HDR_OPTS \
         -c:a copy \
         -c:s srt \
+        "${title_arg[@]}" \
         -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
     
     FFMPEG_PID=$!
