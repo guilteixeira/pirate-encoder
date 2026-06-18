@@ -251,6 +251,19 @@ for input in "${FILES[@]}"; do
         continue
     fi
 
+    # Obtém FPS do vídeo fonte para calcular total de frames e ETA dinâmico
+    VIDEO_FPS_RAW=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=r_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
+    if [[ "$VIDEO_FPS_RAW" == *"/"* ]]; then
+        _fps_n=${VIDEO_FPS_RAW%/*}; _fps_d=${VIDEO_FPS_RAW#*/}
+        VIDEO_FPS_INT=$(( _fps_d > 0 ? _fps_n / _fps_d : 24 ))
+    else
+        VIDEO_FPS_INT=${VIDEO_FPS_RAW%.*}
+    fi
+    [[ -z "$VIDEO_FPS_INT" || "$VIDEO_FPS_INT" -le 0 ]] && VIDEO_FPS_INT=24
+    TOTAL_FRAMES=$(( VIDEO_FPS_INT * TOTAL_SECONDS ))
+
     # Pega dados de HDR
     COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null | tr -d '[:space:]')
 
@@ -292,7 +305,10 @@ for input in "${FILES[@]}"; do
 
     # --- Execução com Porcentagem e Status ---
     echo "🚀 Iniciando encode: $TUNE_NAME @ $B_RATE"
-    echo "⏱️  Duração: $((TOTAL_SECONDS / 60)) min | Espera est.: ~$((TOTAL_SECONDS / 60 / 3)) min"
+    # Estimativa inicial conservadora: assume 50fps de encode (ajustado ao hardware observado)
+    _est_secs=$(( TOTAL_FRAMES / 50 ))
+    _est_min=$(( _est_secs / 60 ))
+    echo "⏱️  Duração: $((TOTAL_SECONDS / 60)) min | Espera est.: ~${_est_min} min"
     echo "--------------------------------------------------"
 
     # Executa ffmpeg com output redirecionado para arquivo temporário
@@ -344,7 +360,19 @@ for input in "${FILES[@]}"; do
                         # Extrai frame e fps compatível com macOS e Linux
                         FRAME=$(echo "$LAST_LINE" | sed -E 's/.*frame= *([0-9]+).*/\1/')
                         FPS=$(echo "$LAST_LINE" | sed -E 's/.*fps= *([0-9]+).*/\1/')
-                        printf "\r\033[K⏳ %02d:%02d | frame=%-6s fps=%-3s [%6.1f%%]" "$ELAPSED_MIN" "$ELAPSED_SEC" "$FRAME" "$FPS" "$PERCENT"
+
+                        # ETA dinâmico baseado no fps real do encode
+                        ETA_STR="--:--"
+                        if [[ -n "$FPS" && "$FPS" -gt 0 && -n "$TOTAL_FRAMES" && "$TOTAL_FRAMES" -gt 0 ]]; then
+                            REMAINING_FRAMES=$(( TOTAL_FRAMES - FRAME ))
+                            if [[ "$REMAINING_FRAMES" -gt 0 ]]; then
+                                ETA_SECS=$(( REMAINING_FRAMES / FPS ))
+                                ETA_STR=$(printf "%02d:%02d" $(( ETA_SECS / 60 )) $(( ETA_SECS % 60 )))
+                            fi
+                        fi
+
+                        printf "\r\033[K⏳ %02d:%02d | frame=%-6s fps=%-3s [%6.1f%%] ETA %s" \
+                            "$ELAPSED_MIN" "$ELAPSED_SEC" "$FRAME" "$FPS" "$PERCENT" "$ETA_STR"
                     fi
                 fi
             fi
