@@ -2,54 +2,67 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [padrão_de_arquivos ou arquivo1 arquivo2...] [--tune anime|action|cult] [--sub-only]"
+    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--audio-lang LANG] [--audio-index N]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
-    echo "  $0 *.mkv                    # wildcards sem aspas"
+    echo "  $0 *.mkv                         # wildcards sem aspas"
     echo "  $0 '*.mkv' --tune anime"
-    echo "  $0 '/caminho/para/*.mkv' --tune action"
-    echo "  $0 '*.mkv' --sub-only       # apenas embute legenda, sem re-encode"
+    echo "  $0 '*.mkv' --tune action"
+    echo "  $0 '*.mkv' --sub-only            # apenas embute legenda, sem re-encode"
+    echo "  $0 '*.mkv' --audio-lang eng      # mantém só áudio em inglês (por tag)"
+    echo "  $0 '*.mkv' --audio-index 4       # mantém só a 5ª faixa de áudio (0-based)"
+    echo ""
+    echo "  # Inspecionar faixas de áudio:"
+    echo "  ffprobe -v error -select_streams a \\"
+    echo "    -show_entries stream=index,codec_name:stream_tags=language \\"
+    echo "    -of compact arquivo.mkv"
     exit 1
 fi
 
-# Coleta argumentos de arquivo (antes de --tune / --sub-only)
+# Coleta argumentos de arquivo e opções
 TUNE_NAME="normal"
 B_RATE="6.5M"; MAX_R="10M"; BUF="13M"
 FILES=()
-PARSING_FILES=true
 SUB_ONLY=false
+AUDIO_LANG=""    # ex: "eng" → -map 0:a:m:language:eng
+AUDIO_IDX=""     # ex: "4"  → -map 0:a:4  (0-based)
+NEXT_ARG_FOR=""
 
 # Parse dos argumentos
 for arg in "$@"; do
-    if [[ "$arg" == "--tune" ]]; then
-        PARSING_FILES=false
+    # Flags que consomem o próximo token
+    case "$arg" in
+        --tune)        NEXT_ARG_FOR="tune";        continue ;;
+        --audio-lang)  NEXT_ARG_FOR="audio-lang";  continue ;;
+        --audio-index) NEXT_ARG_FOR="audio-index"; continue ;;
+        --sub-only)    SUB_ONLY=true;               continue ;;
+    esac
+
+    # Processa o valor do token anterior
+    if [[ -n "$NEXT_ARG_FOR" ]]; then
+        case "$NEXT_ARG_FOR" in
+            tune)
+                case "$arg" in
+                    anime)  B_RATE="5M";  MAX_R="8M";  BUF="10M"; TUNE_NAME="anime"  ;;
+                    action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; TUNE_NAME="action" ;;
+                    cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; TUNE_NAME="cult"   ;;
+                esac
+                ;;
+            audio-lang)  AUDIO_LANG="$arg" ;;
+            audio-index) AUDIO_IDX="$arg"  ;;
+        esac
+        NEXT_ARG_FOR=""
         continue
     fi
 
-    if [[ "$arg" == "--sub-only" ]]; then
-        SUB_ONLY=true
-        continue
-    fi
-    
-    if [[ "$PARSING_FILES" == true ]]; then
-        # Expande wildcard se necessário
-        if [[ "$arg" == *"*"* ]] || [[ "$arg" == *"?"* ]]; then
-            # É um padrão, expande
-            for file in $arg; do
-                [[ -f "$file" ]] && FILES+=("$file")
-            done
-        else
-            # É um arquivo direto
-            [[ -f "$arg" ]] && FILES+=("$arg")
-        fi
+    # Arquivos / wildcards
+    if [[ "$arg" == *"*"* ]] || [[ "$arg" == *"?"* ]]; then
+        for file in $arg; do
+            [[ -f "$file" ]] && FILES+=("$file")
+        done
     else
-        # Processa opções --tune
-        case "$arg" in
-            anime)  B_RATE="5M"; MAX_R="8M"; BUF="10M"; TUNE_NAME="anime" ;;
-            action) B_RATE="10M"; MAX_R="18M"; BUF="20M"; TUNE_NAME="action" ;;
-            cult)   B_RATE="12M"; MAX_R="20M"; BUF="25M"; TUNE_NAME="cult" ;;
-        esac
+        [[ -f "$arg" ]] && FILES+=("$arg")
     fi
 done
 
@@ -64,6 +77,11 @@ if [[ "$SUB_ONLY" == true ]]; then
     echo "📋 Modo: sub-only (remux, sem re-encode)"
 else
     echo "📋 Preset: $TUNE_NAME @ $B_RATE"
+fi
+if [[ -n "$AUDIO_LANG" ]]; then
+    echo "🔊 Áudio: somente lang=$AUDIO_LANG"
+elif [[ -n "$AUDIO_IDX" ]]; then
+    echo "🔊 Áudio: somente índice $AUDIO_IDX (0-based)"
 fi
 echo ""
 
@@ -119,7 +137,7 @@ for input in "${FILES[@]}"; do
     base_name="${input%.*}"  # Remove extensão
     ext="${input##*.}"       # Pega extensão
     clean_name="${base_name//./ }"  # Substitui pontos por espaços
-    output="output/${clean_name}.${ext}"
+    output="output/${clean_name}.mkv"
 
     # Verifica se o output já existe
     if [ -f "$output" ]; then
@@ -153,10 +171,19 @@ for input in "${FILES[@]}"; do
         echo "🚀 Embutindo legenda (sem re-encode)..."
         echo "--------------------------------------------------"
 
+        # Monta mapeamento de áudio para o modo sub-only
+        if [[ -n "$AUDIO_LANG" ]]; then
+            sub_audio_map=("-map" "0:a:m:language:$AUDIO_LANG")
+        elif [[ -n "$AUDIO_IDX" ]]; then
+            sub_audio_map=("-map" "0:a:$AUDIO_IDX")
+        else
+            sub_audio_map=("-map" "0:a")
+        fi
+
         ffmpeg -loglevel error -stats \
             -i "$input" \
             -sub_charenc "$ENCODING" -i "$legenda" \
-            -map 0 -map 1:s:0 \
+            -map 0:v "${sub_audio_map[@]}" -map 1:s:0 \
             -c copy -c:s srt \
             -y "$output" 2>&1
 
@@ -212,7 +239,15 @@ for input in "${FILES[@]}"; do
 
     # --- Configuração de Legenda e Mapas ---
     extra_args=()
-    map_args=("-map" "0:v:0" "-map" "0:a")
+
+    # Seleciona faixa(s) de áudio
+    if [[ -n "$AUDIO_LANG" ]]; then
+        map_args=("-map" "0:v:0" "-map" "0:a:m:language:$AUDIO_LANG")
+    elif [[ -n "$AUDIO_IDX" ]]; then
+        map_args=("-map" "0:v:0" "-map" "0:a:$AUDIO_IDX")
+    else
+        map_args=("-map" "0:v:0" "-map" "0:a")
+    fi
 
     if [ -f "$legenda" ]; then
         ENCODING=$(file -b --mime-encoding "$legenda")
