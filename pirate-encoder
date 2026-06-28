@@ -2,7 +2,7 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--audio-lang LANG] [--audio-index N] [--title-from-file] [--title-eng]"
+    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--sub-sync] [--sub-shift N] [--audio-lang LANG] [--audio-index N] [--title-from-file] [--title-eng]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
@@ -10,12 +10,13 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 '*.mkv' --tune anime"
     echo "  $0 '*.mkv' --tune action"
     echo "  $0 '*.mkv' --sub-only            # apenas embute legenda, sem re-encode"
+    echo "  $0 '*.mkv' --sub-only --sub-sync          # detecta offset pelo 1º timestamp e corrige"
+    echo "  $0 '*.mkv' --sub-only --sub-shift -3.5    # correção manual em segundos"
+    echo "  $0 '*.mkv' --sub-only --sub-shift +2      # legenda adiantada: atrasa 2s (manual)"
     echo "  $0 '*.mkv' --audio-lang eng      # mantém só áudio em inglês (por tag)"
     echo "  $0 '*.mkv' --audio-index 4       # mantém só a 5ª faixa de áudio (0-based)"
     echo "  $0 '*.mkv' --title-from-file     # sobrescreve título dos metadados com o nome do arquivo"
     echo "  $0 '*.mkv' --title-eng            # extrai título inglês de tags no formato 'Russo / English'"
-    echo ""
-    echo "  # Inspecionar faixas de áudio:"
     echo "  ffprobe -v error -select_streams a \\"
     echo "    -show_entries stream=index,codec_name:stream_tags=language \\"
     echo "    -of compact arquivo.mkv"
@@ -31,6 +32,8 @@ AUDIO_LANG=""    # ex: "eng" → -map 0:a:m:language:eng
 AUDIO_IDX=""     # ex: "4"  → -map 0:a:4  (0-based)
 TITLE_FROM_FILE=false
 TITLE_ENG=false
+SUB_SHIFT=""     # ex: "-3.5" ou "+2" → desloca legenda em segundos
+SUB_SYNC=false   # detecta e corrige offset automaticamente via ffsubsync
 NEXT_ARG_FOR=""
 
 # Parse dos argumentos
@@ -40,7 +43,9 @@ for arg in "$@"; do
         --tune)            NEXT_ARG_FOR="tune";        continue ;;
         --audio-lang)      NEXT_ARG_FOR="audio-lang";  continue ;;
         --audio-index)     NEXT_ARG_FOR="audio-index"; continue ;;
+        --sub-shift)       NEXT_ARG_FOR="sub-shift";   continue ;;
         --sub-only)        SUB_ONLY=true;               continue ;;
+        --sub-sync)        SUB_SYNC=true;               continue ;;
         --title-from-file) TITLE_FROM_FILE=true;        continue ;;
         --title-eng)        TITLE_ENG=true;               continue ;;
     esac
@@ -57,6 +62,7 @@ for arg in "$@"; do
                 ;;
             audio-lang)  AUDIO_LANG="$arg" ;;
             audio-index) AUDIO_IDX="$arg"  ;;
+            sub-shift)   SUB_SHIFT="$arg"  ;;
         esac
         NEXT_ARG_FOR=""
         continue
@@ -94,6 +100,12 @@ if [[ "$TITLE_FROM_FILE" == true ]]; then
 elif [[ "$TITLE_ENG" == true ]]; then
     echo "🏷️  Título: será extraído da tag existente (parte após ' / ')"
 fi
+if [[ -n "$SUB_SHIFT" ]]; then
+    echo "⏩ Sub-shift: ${SUB_SHIFT}s (legendas serão deslocadas antes de embutir)"
+fi
+if [[ "$SUB_SYNC" == true ]]; then
+    echo "🔄 Sub-sync: offset automático via áudio"
+fi
 echo ""
 
 # --- Detecta o Sistema Operacional ---
@@ -118,6 +130,75 @@ case "${OS}" in
         exit 1
         ;;
 esac
+
+# --- Função: desloca timestamps de um .srt em N milissegundos ---
+# Uso: shift_srt <origem.srt> <destino.srt> <segundos>
+# segundos pode ser negativo ou decimal (ex: -3.5, +2, 1.25)
+shift_srt() {
+    local src="$1" dst="$2" shift_sec="$3"
+    # Converte segundos → milissegundos inteiros (bc lida com decimais e negativos)
+    local shift_ms
+    shift_ms=$(printf '%.0f' "$(echo "$shift_sec * 1000" | bc -l)")
+    LC_ALL=C awk -v shift="$shift_ms" '
+        function ts2ms(t,   a) {
+            gsub(",", ":", t)
+            split(t, a, ":")
+            return (a[1]*3600 + a[2]*60 + a[3]) * 1000 + a[4]
+        }
+        function ms2ts(ms,  h, m, s, r) {
+            if (ms < 0) ms = 0
+            h = int(ms / 3600000); ms -= h * 3600000
+            m = int(ms / 60000);   ms -= m * 60000
+            s = int(ms / 1000);    ms -= s * 1000
+            return sprintf("%02d:%02d:%02d,%03d", h, m, s, ms)
+        }
+        /[0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9][0-9][0-9] --> / {
+            n = split($0, p, " --> ")
+            printf "%s --> %s\n", ms2ts(ts2ms(p[1]) + shift), ms2ts(ts2ms(p[2]) + shift)
+            next
+        }
+        { print }
+    ' "$src" > "$dst"
+}
+
+# --- Função: detecta offset pelo primeiro timestamp do .srt e aplica shift negativo ---
+# Uso: auto_sync_srt <origem.srt> <destino.srt>
+# Lê o 1º timestamp, usa como offset negativo para alinhar legenda ao início do vídeo.
+auto_sync_srt() {
+    local src="$1" dst="$2"
+
+    # Primeiro timestamp do arquivo (ex: "00:00:16,966 --> 00:00:18,600")
+    local first_line
+    first_line=$(LC_ALL=C grep -m1 '[0-9][0-9]:[0-9][0-9]:[0-9][0-9],[0-9][0-9][0-9]' "$src")
+
+    if [[ -z "$first_line" ]]; then
+        echo "⚠️  Sub-sync: não encontrou timestamps no .srt — legenda original mantida"
+        cp "$src" "$dst"
+        return 1
+    fi
+
+    # Extrai só o start time antes do " --> "
+    local start_ts
+    start_ts=$(echo "$first_line" | LC_ALL=C sed -E 's/([0-9]{2}:[0-9]{2}:[0-9]{2},[0-9]{3}).*/\1/')
+
+    # Converte HH:MM:SS,mmm → milissegundos
+    local h m s ms
+    IFS=':,' read -r h m s ms <<< "$start_ts"
+    local offset_ms=$(( 10#$h * 3600000 + 10#$m * 60000 + 10#$s * 1000 + 10#$ms ))
+
+    if [[ $offset_ms -eq 0 ]]; then
+        echo "🔄 Sub-sync: legenda já começa em 00:00:00 — nenhum ajuste necessário"
+        cp "$src" "$dst"
+        return 0
+    fi
+
+    # Formata para exibição (ex: "16.966s")
+    local offset_sec
+    offset_sec=$(echo "scale=3; $offset_ms / 1000" | bc)
+
+    echo "🔄 Sub-sync: 1º timestamp ${start_ts} → deslocando -${offset_sec}s"
+    shift_srt "$src" "$dst" "-${offset_sec}"
+}
 
 # --- Processamento em Fila ---
 TOTAL_FILES=${#FILES[@]}
@@ -198,6 +279,26 @@ for input in "${FILES[@]}"; do
         fi
 
         echo "🎯 Legenda: $legenda (encoding: $ENCODING)"
+
+        # Pipeline de transformação: sync automático → shift manual (ambos opcionais, encadeáveis)
+        legenda_final="$legenda"
+        SUB_TMPS=()
+
+        if [[ "$SUB_SYNC" == true ]]; then
+            _sync_tmp=$(mktemp /tmp/synced_XXXXXX.srt)
+            SUB_TMPS+=("$_sync_tmp")
+            auto_sync_srt "$legenda_final" "$_sync_tmp"
+            legenda_final="$_sync_tmp"
+        fi
+
+        if [[ -n "$SUB_SHIFT" ]]; then
+            _shift_tmp=$(mktemp /tmp/shifted_XXXXXX.srt)
+            SUB_TMPS+=("$_shift_tmp")
+            shift_srt "$legenda_final" "$_shift_tmp" "$SUB_SHIFT"
+            legenda_final="$_shift_tmp"
+            echo "⏩ Legenda deslocada ${SUB_SHIFT}s adicional"
+        fi
+
         echo "🚀 Embutindo legenda (sem re-encode)..."
         echo "--------------------------------------------------"
 
@@ -212,13 +313,14 @@ for input in "${FILES[@]}"; do
 
         ffmpeg -loglevel error -stats \
             -i "$input" \
-            -sub_charenc "$ENCODING" -i "$legenda" \
+            -sub_charenc "$ENCODING" -i "$legenda_final" \
             -map 0:v "${sub_audio_map[@]}" -map 1:s:0 \
             -c copy -c:s srt \
             "${title_arg[@]}" \
             -y "$output" 2>&1
 
         FFMPEG_EXIT=$?
+        for tmp in "${SUB_TMPS[@]}"; do rm -f "$tmp"; done
 
         if [ $FFMPEG_EXIT -eq 0 ]; then
             echo "--------------------------------------------------"
@@ -298,9 +400,29 @@ for input in "${FILES[@]}"; do
         if [[ "$ENCODING" == "unknown-8bit" || "$ENCODING" == "binary" ]]; then
             ENCODING="iso-8859-1"
         fi
-        extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda")
+        echo "🎯 Legenda encontrada: $legenda (encoding: $ENCODING)"
+
+        # Pipeline de transformação: sync automático → shift manual (ambos opcionais, encadeáveis)
+        legenda_enc="$legenda"
+        SUB_TMPS_ENC=()
+
+        if [[ "$SUB_SYNC" == true ]]; then
+            _sync_tmp=$(mktemp /tmp/synced_XXXXXX.srt)
+            SUB_TMPS_ENC+=("$_sync_tmp")
+            auto_sync_srt "$legenda_enc" "$_sync_tmp"
+            legenda_enc="$_sync_tmp"
+        fi
+
+        if [[ -n "$SUB_SHIFT" ]]; then
+            _shift_tmp=$(mktemp /tmp/shifted_XXXXXX.srt)
+            SUB_TMPS_ENC+=("$_shift_tmp")
+            shift_srt "$legenda_enc" "$_shift_tmp" "$SUB_SHIFT"
+            legenda_enc="$_shift_tmp"
+            echo "⏩ Legenda deslocada ${SUB_SHIFT}s adicional"
+        fi
+
+        extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda_enc")
         map_args+=("-map" "1:s:0")
-        echo "🎯 Legenda encontrada: $legenda"
     fi
 
     # --- Execução com Porcentagem e Status ---
@@ -386,6 +508,7 @@ for input in "${FILES[@]}"; do
     
     # Limpeza
     rm -f "$FFMPEG_OUTPUT"
+    for tmp in "${SUB_TMPS_ENC[@]:-}"; do [[ -f "$tmp" ]] && rm -f "$tmp"; done
 
     # Verifica se o ffmpeg completou com sucesso
     if [ $FFMPEG_EXIT -eq 0 ]; then
