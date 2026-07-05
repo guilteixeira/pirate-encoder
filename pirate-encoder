@@ -2,24 +2,23 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--sub-sync] [--sub-shift N] [--audio-lang LANG] [--audio-index N] [--title-from-file] [--title-eng]"
+    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--sub-sync] [--sub-shift N] [--audio-lang LANG[,LANG...]] [--audio-index N] [--sub-lang LANG] [--title-from-file] [--title-eng]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
-    echo "  $0 *.mkv                         # wildcards sem aspas"
+    echo "  $0 *.mkv                                    # wildcards sem aspas"
     echo "  $0 '*.mkv' --tune anime"
     echo "  $0 '*.mkv' --tune action"
-    echo "  $0 '*.mkv' --sub-only            # apenas embute legenda, sem re-encode"
-    echo "  $0 '*.mkv' --sub-only --sub-sync          # detecta offset pelo 1º timestamp e corrige"
-    echo "  $0 '*.mkv' --sub-only --sub-shift -3.5    # correção manual em segundos"
-    echo "  $0 '*.mkv' --sub-only --sub-shift +2      # legenda adiantada: atrasa 2s (manual)"
-    echo "  $0 '*.mkv' --audio-lang eng      # mantém só áudio em inglês (por tag)"
-    echo "  $0 '*.mkv' --audio-index 4       # mantém só a 5ª faixa de áudio (0-based)"
-    echo "  $0 '*.mkv' --title-from-file     # sobrescreve título dos metadados com o nome do arquivo"
-    echo "  $0 '*.mkv' --title-eng            # extrai título inglês de tags no formato 'Russo / English'"
-    echo "  ffprobe -v error -select_streams a \\"
-    echo "    -show_entries stream=index,codec_name:stream_tags=language \\"
-    echo "    -of compact arquivo.mkv"
+    echo "  $0 '*.mkv' --sub-only                       # apenas embute legenda, sem re-encode"
+    echo "  $0 '*.mkv' --sub-only --sub-sync            # detecta offset pelo 1º timestamp e corrige"
+    echo "  $0 '*.mkv' --sub-only --sub-shift -3.5      # correção manual em segundos"
+    echo "  $0 '*.mkv' --audio-lang eng                 # mantém só áudio em inglês"
+    echo "  $0 '*.mkv' --audio-lang por,eng             # mantém PT-BR e inglês (ordem preservada)"
+    echo "  $0 '*.mkv' --audio-index 4                  # mantém só a 5ª faixa de áudio (0-based)"
+    echo "  $0 '*.mkv' --sub-lang por                   # preserva legenda embarcada em português"
+    echo "  $0 '*.mkv' --audio-lang por,eng --sub-lang por  # multi-áudio + legenda embarcada"
+    echo "  $0 '*.mkv' --title-from-file                # sobrescreve título pelo nome do arquivo"
+    echo "  $0 '*.mkv' --title-eng                      # extrai título inglês (parte após ' / ')"
     exit 1
 fi
 
@@ -28,8 +27,9 @@ TUNE_NAME="normal"
 B_RATE="6.5M"; MAX_R="10M"; BUF="13M"
 FILES=()
 SUB_ONLY=false
-AUDIO_LANG=""    # ex: "eng" → -map 0:a:m:language:eng
-AUDIO_IDX=""     # ex: "4"  → -map 0:a:4  (0-based)
+AUDIO_LANG=""    # ex: "por,eng" → múltiplos -map 0:a:m:language:X
+AUDIO_IDX=""     # ex: "4"      → -map 0:a:4  (0-based, único)
+SUB_LANG=""      # ex: "por"    → preserva legenda embarcada do container por tag
 TITLE_FROM_FILE=false
 TITLE_ENG=false
 SUB_SHIFT=""     # ex: "-3.5" ou "+2" → desloca legenda em segundos
@@ -43,6 +43,7 @@ for arg in "$@"; do
         --tune)            NEXT_ARG_FOR="tune";        continue ;;
         --audio-lang)      NEXT_ARG_FOR="audio-lang";  continue ;;
         --audio-index)     NEXT_ARG_FOR="audio-index"; continue ;;
+        --sub-lang)        NEXT_ARG_FOR="sub-lang";    continue ;;
         --sub-shift)       NEXT_ARG_FOR="sub-shift";   continue ;;
         --sub-only)        SUB_ONLY=true;               continue ;;
         --sub-sync)        SUB_SYNC=true;               continue ;;
@@ -62,6 +63,7 @@ for arg in "$@"; do
                 ;;
             audio-lang)  AUDIO_LANG="$arg" ;;
             audio-index) AUDIO_IDX="$arg"  ;;
+            sub-lang)    SUB_LANG="$arg"   ;;
             sub-shift)   SUB_SHIFT="$arg"  ;;
         esac
         NEXT_ARG_FOR=""
@@ -91,9 +93,12 @@ else
     echo "📋 Preset: $TUNE_NAME @ $B_RATE"
 fi
 if [[ -n "$AUDIO_LANG" ]]; then
-    echo "🔊 Áudio: somente lang=$AUDIO_LANG"
+    echo "🔊 Áudio: lang=${AUDIO_LANG// /} (ordem preservada)"
 elif [[ -n "$AUDIO_IDX" ]]; then
     echo "🔊 Áudio: somente índice $AUDIO_IDX (0-based)"
+fi
+if [[ -n "$SUB_LANG" ]]; then
+    echo "💬 Legenda embarcada: preservando lang=${SUB_LANG}"
 fi
 if [[ "$TITLE_FROM_FILE" == true ]]; then
     echo "🏷️  Título: será reescrito pelo nome do arquivo"
@@ -322,20 +327,31 @@ for input in "${FILES[@]}"; do
         echo "🚀 Embutindo legenda (sem re-encode)..."
         echo "--------------------------------------------------"
 
-        # Monta mapeamento de áudio para o modo sub-only
+        # Monta mapeamento de áudio (suporta multi-idioma via vírgula)
+        sub_audio_map=()
         if [[ -n "$AUDIO_LANG" ]]; then
-            sub_audio_map=("-map" "0:a:m:language:$AUDIO_LANG")
+            IFS=',' read -ra _langs <<< "$AUDIO_LANG"
+            for _lang in "${_langs[@]}"; do
+                sub_audio_map+=("-map" "0:a:m:language:${_lang}")
+            done
         elif [[ -n "$AUDIO_IDX" ]]; then
             sub_audio_map=("-map" "0:a:$AUDIO_IDX")
         else
             sub_audio_map=("-map" "0:a")
         fi
 
+        # Legenda embarcada do container (--sub-lang) vai antes do .srt externo
+        sub_embedded_map=()
+        if [[ -n "$SUB_LANG" ]]; then
+            sub_embedded_map=("-map" "0:s:m:language:${SUB_LANG}")
+            echo "💬 Legenda embarcada lang=${SUB_LANG} preservada"
+        fi
+
         ffmpeg -loglevel error -stats \
             -i "$input" \
             -sub_charenc "$ENCODING" -i "$legenda_final" \
-            -map 0:v "${sub_audio_map[@]}" -map 1:s:0 \
-            -c copy -c:s srt \
+            -map 0:v "${sub_audio_map[@]}" "${sub_embedded_map[@]}" -map 1:s:0 \
+            -c copy -c:s copy \
             "${title_arg[@]}" \
             -y "$output" 2>&1
 
@@ -407,12 +423,22 @@ for input in "${FILES[@]}"; do
     extra_args=()
 
     # Seleciona faixa(s) de áudio
+    # AUDIO_LANG pode ser "por,eng" → gera um -map por idioma, na ordem informada
     if [[ -n "$AUDIO_LANG" ]]; then
-        map_args=("-map" "0:v:0" "-map" "0:a:m:language:$AUDIO_LANG")
+        map_args=("-map" "0:v:0")
+        IFS=',' read -ra _langs <<< "$AUDIO_LANG"
+        for _lang in "${_langs[@]}"; do
+            map_args+=("-map" "0:a:m:language:${_lang}")
+        done
     elif [[ -n "$AUDIO_IDX" ]]; then
         map_args=("-map" "0:v:0" "-map" "0:a:$AUDIO_IDX")
     else
         map_args=("-map" "0:v:0" "-map" "0:a")
+    fi
+
+    # Legenda embarcada do container (--sub-lang): mapeada antes do .srt externo
+    if [[ -n "$SUB_LANG" ]]; then
+        map_args+=("-map" "0:s:m:language:${SUB_LANG}")
     fi
 
     if [ -f "$legenda" ]; then
@@ -469,7 +495,7 @@ for input in "${FILES[@]}"; do
         $RC_OPTS \
         $HDR_OPTS \
         -c:a copy \
-        -c:s srt \
+        -c:s copy \
         "${title_arg[@]}" \
         -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
     
@@ -538,6 +564,8 @@ for input in "${FILES[@]}"; do
     else
         echo -e "\n--------------------------------------------------"
         echo "❌ [$CURRENT_FILE/$TOTAL_FILES] Erro durante o encode!"
+        echo "   Log ffmpeg:"
+        grep -v '^$' "$FFMPEG_OUTPUT" | sed 's/^/   /' || true
         FAILED_FILES+=("$input")
     fi
 
