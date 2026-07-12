@@ -2,7 +2,7 @@
 
 # --- Validação de Argumentos ---
 if [[ $# -lt 1 ]]; then
-    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--sub-sync] [--sub-shift N] [--audio-lang LANG[,LANG...]] [--audio-index N] [--sub-lang LANG] [--title-from-file] [--title-eng]"
+    echo "❌ Uso: $0 [arquivos...] [--tune anime|action|cult] [--sub-only] [--sub-sync] [--sub-shift N] [--audio-lang LANG[,LANG...]] [--audio-index N] [--sub-lang LANG] [--organize] [--title-from-file] [--title-eng]"
     echo ""
     echo "Exemplos:"
     echo "  $0 '*.mkv'"
@@ -17,6 +17,9 @@ if [[ $# -lt 1 ]]; then
     echo "  $0 '*.mkv' --audio-index 4                  # mantém só a 5ª faixa de áudio (0-based)"
     echo "  $0 '*.mkv' --sub-lang por                   # preserva legenda embarcada em português"
     echo "  $0 '*.mkv' --audio-lang por,eng --sub-lang por  # multi-áudio + legenda embarcada"
+    echo "  $0 '*.mkv' --organize                       # organiza output em pastas via TMDB (requer --tmdb-key)"
+    echo "  $0 '*.mkv' --organize-only                  # apenas organiza, sem re-encode (para testar)"
+    echo "  $0 '*.mkv' --organize --tmdb-key KEY        # ou exporte TMDB_API_KEY no ambiente"
     echo "  $0 '*.mkv' --title-from-file                # sobrescreve título pelo nome do arquivo"
     echo "  $0 '*.mkv' --title-eng                      # extrai título inglês (parte após ' / ')"
     exit 1
@@ -33,7 +36,10 @@ SUB_LANG=""      # ex: "por"    → preserva legenda embarcada do container por 
 TITLE_FROM_FILE=false
 TITLE_ENG=false
 SUB_SHIFT=""     # ex: "-3.5" ou "+2" → desloca legenda em segundos
-SUB_SYNC=false   # detecta e corrige offset automaticamente via ffsubsync
+SUB_SYNC=false   # detecta e corrige offset automaticamente
+ORGANIZE=false       # organiza output em pastas após encode
+ORGANIZE_ONLY=false  # apenas organiza arquivos já existentes em output/, sem re-encode
+TMDB_KEY="${TMDB_API_KEY:-}"  # lido do env TMDB_API_KEY ou --tmdb-key
 NEXT_ARG_FOR=""
 
 # Parse dos argumentos
@@ -47,6 +53,9 @@ for arg in "$@"; do
         --sub-shift)       NEXT_ARG_FOR="sub-shift";   continue ;;
         --sub-only)        SUB_ONLY=true;               continue ;;
         --sub-sync)        SUB_SYNC=true;               continue ;;
+        --organize)        ORGANIZE=true;               continue ;;
+        --organize-only)   ORGANIZE=true; ORGANIZE_ONLY=true; continue ;;
+        --tmdb-key)        NEXT_ARG_FOR="tmdb-key";    continue ;;
         --title-from-file) TITLE_FROM_FILE=true;        continue ;;
         --title-eng)        TITLE_ENG=true;               continue ;;
     esac
@@ -65,6 +74,7 @@ for arg in "$@"; do
             audio-index) AUDIO_IDX="$arg"  ;;
             sub-lang)    SUB_LANG="$arg"   ;;
             sub-shift)   SUB_SHIFT="$arg"  ;;
+            tmdb-key)    TMDB_KEY="$arg"   ;;
         esac
         NEXT_ARG_FOR=""
         continue
@@ -87,7 +97,9 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
 fi
 
 echo "✅ Encontrados ${#FILES[@]} arquivo(s) para processar"
-if [[ "$SUB_ONLY" == true ]]; then
+if [[ "$ORGANIZE_ONLY" == true ]]; then
+    echo "📂 Modo: organize-only (sem encode)"
+elif [[ "$SUB_ONLY" == true ]]; then
     echo "📋 Modo: sub-only (remux, sem re-encode)"
 else
     echo "📋 Preset: $TUNE_NAME @ $B_RATE"
@@ -225,6 +237,145 @@ auto_sync_srt() {
     fi
 }
 
+# --- Função: consulta TMDB para obter título oficial e ano ---
+# Uso: tmdb_search movie|tv "Título para busca" [ano]
+# Retorna: "Título Oficial|Ano" ou sai com código 1 se não encontrar
+tmdb_search() {
+    local type="$1" query="$2" year="${3:-}"
+    local url_path
+    [[ "$type" == "movie" ]] && url_path="search/movie" || url_path="search/tv"
+
+    local response
+    # Detecta tipo de credencial pelo tamanho:
+    # v3 API key = 32 chars hex  →  ?api_key=KEY
+    # Access Token (JWT) = 200+ chars  →  Authorization: Bearer TOKEN
+    if [[ ${#TMDB_KEY} -gt 100 ]]; then
+        response=$(curl -sf -G \
+            -H "Authorization: Bearer $TMDB_KEY" \
+            -H "accept: application/json" \
+            --data-urlencode "query=$query" \
+            ${year:+--data-urlencode "year=$year"} \
+            "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
+    else
+        response=$(curl -sf -G \
+            -H "accept: application/json" \
+            --data-urlencode "query=$query" \
+            --data-urlencode "api_key=$TMDB_KEY" \
+            ${year:+--data-urlencode "year=$year"} \
+            "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
+    fi
+    [[ -z "$response" ]] && return 1
+
+    if [[ "$type" == "movie" ]]; then
+        local title yr
+        title=$(printf '%s' "$response" | grep -o '"title":"[^"]*"' | head -1 \
+            | sed 's/^"title":"//;s/"$//')
+        yr=$(printf '%s' "$response" | grep -o '"release_date":"[0-9]\{4\}' | head -1 \
+            | sed 's/^"release_date":"//') 
+        [[ -n "$title" ]] && printf '%s|%s\n' "$title" "$yr" && return 0
+    else
+        local name yr
+        name=$(printf '%s' "$response" | grep -o '"name":"[^"]*"' | head -1 \
+            | sed 's/^"name":"//;s/"$//')
+        yr=$(printf '%s' "$response" | grep -o '"first_air_date":"[0-9]\{4\}' | head -1 \
+            | sed 's/^"first_air_date":"//') 
+        [[ -n "$name" ]] && printf '%s|%s\n' "$name" "$yr" && return 0
+    fi
+    return 1
+}
+
+# --- Função: converte .srt para UTF-8 via iconv ---
+# Uso: normalize_srt_encoding <origem> <destino> <encoding>
+# Se já for UTF-8/ASCII copia sem conversão.
+normalize_srt_encoding() {
+    local src="$1" dst="$2" encoding="$3"
+    if [[ "$encoding" == "utf-8" || "$encoding" == "us-ascii" ]]; then
+        cp "$src" "$dst"; return 0
+    fi
+    if iconv -f "$encoding" -t UTF-8 "$src" > "$dst" 2>/dev/null && [[ -s "$dst" ]]; then
+        return 0
+    fi
+    # iconv falhou — copia sem conversão como fallback
+    cp "$src" "$dst"; return 1
+}
+
+# --- Função: organiza arquivo de saída em estrutura de pastas ---
+# Filmes:  output/Título (Ano)/Título (Ano).mkv
+# Séries:  output/Título/Season XX/arquivo.mkv
+#
+# Com --tmdb-key: título oficial via API TMDB
+# Sem --tmdb-key: título do metadado embutido, com fallback para parse do filename
+organize_output() {
+    local file="$1" src_name="$2"
+
+    # --- Detecta série vs filme pelo padrão SxxExx ---
+    local season_num=""
+    [[ "$src_name" =~ [Ss]([0-9]{2})[Ee]([0-9]{2}) ]] && season_num="${BASH_REMATCH[1]}"
+
+    # --- Extrai ano do filename ---
+    local year=""
+    [[ "$src_name" =~ (19[0-9]{2}|20[0-9]{2}) ]] && year="${BASH_REMATCH[1]}"
+
+    # --- "Título base" para busca: tudo antes do SxxExx ou do ano, sem tags de qualidade ---
+    local parsed="${src_name%.*}"; parsed="${parsed//./ }"
+    local search_title
+    if [[ -n "$season_num" ]]; then
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E 's/ [Ss][0-9]{2}[Ee][0-9]{2}.*//')
+    elif [[ -n "$year" ]]; then
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E "s/ ${year}.*//")
+    else
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E \
+            's/ (PROPER|REPACK|EXTENDED|2160p|1080p|720p|BluRay|WEB-DL|REMUX|HEVC|x265|x264|DTS|AAC|HDR|DV|Hybrid).*//')
+    fi
+    search_title="${search_title## }"; search_title="${search_title%% }"
+
+    local final_title="" final_year="$year"
+
+    # --- 1. TMDB (título oficial via API) ---
+    if [[ -n "$TMDB_KEY" ]]; then
+        local tmdb_result
+        if [[ -n "$season_num" ]]; then
+            tmdb_result=$(tmdb_search tv "$search_title" 2>/dev/null)
+        else
+            tmdb_result=$(tmdb_search movie "$search_title" "$year" 2>/dev/null)
+        fi
+        if [[ -n "$tmdb_result" ]]; then
+            final_title="${tmdb_result%%|*}"
+            local tmdb_year="${tmdb_result##*|}"
+            [[ -n "$tmdb_year" ]] && final_year="$tmdb_year"
+            echo "   🎬 TMDB: $final_title ($final_year)"
+        else
+            echo "   ⚠️  TMDB não encontrou resultado para \"$search_title\" — usando parse do filename"
+        fi
+    fi
+
+    # --- 2. Parse limpo do filename (fallback sem TMDB) ---
+    # Não usa metadados do arquivo: o título embutido pelo source costuma ter lixo de release group.
+    [[ -z "$final_title" ]] && final_title="$search_title"
+
+    # Sanitiza para uso em nome de pasta
+    local safe_title
+    safe_title=$(printf '%s' "$final_title" | LC_ALL=C sed 's|[/:*?"<>|\\]||g' | LC_ALL=C sed 's/  */ /g')
+    safe_title="${safe_title## }"; safe_title="${safe_title%% }"
+
+    local dest_dir dest_file
+    if [[ -n "$season_num" ]]; then
+        dest_dir="output/${safe_title}/Season ${season_num}"
+        dest_file="$(basename "$file")"
+        echo "📁 Série → ${safe_title}/Season ${season_num}/"
+    else
+        local folder="${safe_title}"
+        [[ -n "$final_year" ]] && folder="${safe_title} (${final_year})"
+        dest_dir="output/${folder}"
+        dest_file="${folder}.mkv"
+        echo "📁 Filme → ${folder}/"
+    fi
+
+    mkdir -p "$dest_dir"
+    mv "$file" "${dest_dir}/${dest_file}"
+    echo "   ✓ ${dest_dir}/${dest_file}"
+}
+
 # --- Processamento em Fila ---
 TOTAL_FILES=${#FILES[@]}
 CURRENT_FILE=1
@@ -258,6 +409,15 @@ for input in "${FILES[@]}"; do
 
     # Metadado de título (opcional)
     title_arg=()
+
+    # --- MODO ORGANIZE-ONLY: organiza o próprio arquivo de entrada ---
+    if [[ "$ORGANIZE_ONLY" == true ]]; then
+        organize_output "$input" "$(basename "$input")"
+        COMPLETED_FILES+=("$input")
+        ((CURRENT_FILE++))
+        continue
+    fi
+
     if [[ "$TITLE_ENG" == true ]]; then
         CURRENT_TITLE=$(ffprobe -v error -show_entries format_tags=title \
             -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null)
@@ -305,9 +465,19 @@ for input in "${FILES[@]}"; do
 
         echo "🎯 Legenda: $legenda (encoding: $ENCODING)"
 
-        # Pipeline de transformação: sync automático → shift manual (ambos opcionais, encadeáveis)
+        # Pipeline de transformação: normaliza UTF-8 → sync → shift
         legenda_final="$legenda"
         SUB_TMPS=()
+
+        # 1. Converte para UTF-8 (evita caracteres quebrados no container)
+        if [[ "$ENCODING" != "utf-8" && "$ENCODING" != "us-ascii" ]]; then
+            _norm_tmp=$(mktemp /tmp/norm_XXXXXX.srt)
+            SUB_TMPS+=("$_norm_tmp")
+            if normalize_srt_encoding "$legenda_final" "$_norm_tmp" "$ENCODING"; then
+                legenda_final="$_norm_tmp"
+                echo "🔤 Encoding convertido: $ENCODING → utf-8"
+            fi
+        fi
 
         if [[ "$SUB_SYNC" == true ]]; then
             _sync_tmp=$(mktemp /tmp/synced_XXXXXX.srt)
@@ -349,7 +519,7 @@ for input in "${FILES[@]}"; do
 
         ffmpeg -loglevel error -stats \
             -i "$input" \
-            -sub_charenc "$ENCODING" -i "$legenda_final" \
+            -i "$legenda_final" \
             -map 0:v "${sub_audio_map[@]}" "${sub_embedded_map[@]}" -map 1:s:0 \
             -c copy -c:s copy \
             "${title_arg[@]}" \
@@ -361,6 +531,7 @@ for input in "${FILES[@]}"; do
         if [ $FFMPEG_EXIT -eq 0 ]; then
             echo "--------------------------------------------------"
             echo "✅ [$CURRENT_FILE/$TOTAL_FILES] Legenda embutida com sucesso!"
+            [[ "$ORGANIZE" == true ]] && organize_output "$output" "$(basename "$input")"
             COMPLETED_FILES+=("$input")
         else
             echo "--------------------------------------------------"
@@ -448,9 +619,19 @@ for input in "${FILES[@]}"; do
         fi
         echo "🎯 Legenda encontrada: $legenda (encoding: $ENCODING)"
 
-        # Pipeline de transformação: sync automático → shift manual (ambos opcionais, encadeáveis)
+        # Pipeline de transformação: normaliza UTF-8 → sync → shift
         legenda_enc="$legenda"
         SUB_TMPS_ENC=()
+
+        # 1. Converte para UTF-8
+        if [[ "$ENCODING" != "utf-8" && "$ENCODING" != "us-ascii" ]]; then
+            _norm_tmp=$(mktemp /tmp/norm_XXXXXX.srt)
+            SUB_TMPS_ENC+=("$_norm_tmp")
+            if normalize_srt_encoding "$legenda_enc" "$_norm_tmp" "$ENCODING"; then
+                legenda_enc="$_norm_tmp"
+                echo "🔤 Encoding convertido: $ENCODING → utf-8"
+            fi
+        fi
 
         if [[ "$SUB_SYNC" == true ]]; then
             _sync_tmp=$(mktemp /tmp/synced_XXXXXX.srt)
@@ -467,7 +648,7 @@ for input in "${FILES[@]}"; do
             echo "⏩ Legenda deslocada ${SUB_SHIFT}s adicional"
         fi
 
-        extra_args+=("-sub_charenc" "$ENCODING" "-i" "$legenda_enc")
+        extra_args+=("-i" "$legenda_enc")
         map_args+=("-map" "1:s:0")
     fi
 
@@ -560,6 +741,7 @@ for input in "${FILES[@]}"; do
     if [ $FFMPEG_EXIT -eq 0 ]; then
         echo -e "\n--------------------------------------------------"
         echo "✅ [$CURRENT_FILE/$TOTAL_FILES] Concluído com sucesso!"
+        [[ "$ORGANIZE" == true ]] && organize_output "$output" "$(basename "$input")"
         COMPLETED_FILES+=("$input")
     else
         echo -e "\n--------------------------------------------------"
