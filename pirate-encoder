@@ -237,18 +237,27 @@ auto_sync_srt() {
     fi
 }
 
-# --- Função: consulta TMDB para obter título oficial e ano ---
-# Uso: tmdb_search movie|tv "Título para busca" [ano]
-# Retorna: "Título Oficial|Ano" ou sai com código 1 se não encontrar
+# --- Helper: GET autenticado para a TMDB API ---
+# Detecta automaticamente v3 key (32 chars) vs Access Token JWT (200+ chars)
+tmdb_curl() {
+    local url="$1"
+    if [[ ${#TMDB_KEY} -gt 100 ]]; then
+        curl -sf -H "Authorization: Bearer $TMDB_KEY" \
+                 -H "accept: application/json" "$url" 2>/dev/null
+    else
+        local sep="?"; [[ "$url" == *"?"* ]] && sep="&"
+        curl -sf -H "accept: application/json" \
+             "${url}${sep}api_key=${TMDB_KEY}" 2>/dev/null
+    fi
+}
+
+# --- Função: search TMDB → retorna "Título|Ano|ID" ---
 tmdb_search() {
     local type="$1" query="$2" year="${3:-}"
     local url_path
     [[ "$type" == "movie" ]] && url_path="search/movie" || url_path="search/tv"
 
     local response
-    # Detecta tipo de credencial pelo tamanho:
-    # v3 API key = 32 chars hex  →  ?api_key=KEY
-    # Access Token (JWT) = 200+ chars  →  Authorization: Bearer TOKEN
     if [[ ${#TMDB_KEY} -gt 100 ]]; then
         response=$(curl -sf -G \
             -H "Authorization: Bearer $TMDB_KEY" \
@@ -266,22 +275,105 @@ tmdb_search() {
     fi
     [[ -z "$response" ]] && return 1
 
+    local title yr id
     if [[ "$type" == "movie" ]]; then
-        local title yr
         title=$(printf '%s' "$response" | grep -o '"title":"[^"]*"' | head -1 \
             | sed 's/^"title":"//;s/"$//')
         yr=$(printf '%s' "$response" | grep -o '"release_date":"[0-9]\{4\}' | head -1 \
             | sed 's/^"release_date":"//') 
-        [[ -n "$title" ]] && printf '%s|%s\n' "$title" "$yr" && return 0
+        id=$(printf '%s' "$response" | grep -o '"id":[0-9]*' | head -1 | sed 's/^"id"://')
+        [[ -n "$title" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
     else
-        local name yr
-        name=$(printf '%s' "$response" | grep -o '"name":"[^"]*"' | head -1 \
+        title=$(printf '%s' "$response" | grep -o '"name":"[^"]*"' | head -1 \
             | sed 's/^"name":"//;s/"$//')
         yr=$(printf '%s' "$response" | grep -o '"first_air_date":"[0-9]\{4\}' | head -1 \
             | sed 's/^"first_air_date":"//') 
-        [[ -n "$name" ]] && printf '%s|%s\n' "$name" "$yr" && return 0
+        id=$(printf '%s' "$response" | grep -o '"id":[0-9]*' | head -1 | sed 's/^"id"://')
+        [[ -n "$title" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
     fi
     return 1
+}
+
+# --- Função: resolve metadados TMDB completos para um arquivo ---
+# Popula as variáveis globais TMDB_* e TMDB_META_ARGS.
+# Chamada uma vez por arquivo no início do loop quando ORGANIZE=true e TMDB_KEY definida.
+resolve_tmdb_for_file() {
+    local src_name="$1"
+    TMDB_TITLE="" TMDB_YEAR="" TMDB_ID="" TMDB_OVERVIEW="" TMDB_GENRES=""
+    TMDB_META_ARGS=()
+
+    # Extrai metadados do filename
+    local season_num="" episode_num="" year=""
+    [[ "$src_name" =~ [Ss]([0-9]{2})[Ee]([0-9]{2}) ]] \
+        && season_num="${BASH_REMATCH[1]}" && episode_num="${BASH_REMATCH[2]}"
+    [[ "$src_name" =~ (19[0-9]{2}|20[0-9]{2}) ]] && year="${BASH_REMATCH[1]}"
+
+    local parsed="${src_name%.*}"; parsed="${parsed//./ }"
+    local search_title
+    if [[ -n "$season_num" ]]; then
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E 's/ [Ss][0-9]{2}[Ee][0-9]{2}.*//')
+    elif [[ -n "$year" ]]; then
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E "s/ ${year}.*//")
+    else
+        search_title=$(printf '%s' "$parsed" | LC_ALL=C sed -E \
+            's/ (PROPER|REPACK|EXTENDED|2160p|1080p|720p|BluRay|WEB-DL|REMUX|HEVC|x265|x264|DTS|AAC|HDR|DV|Hybrid).*//')
+    fi
+    search_title="${search_title## }"; search_title="${search_title%% }"
+
+    # 1. Search → título + ano + ID
+    local search_result
+    if [[ -n "$season_num" ]]; then
+        search_result=$(tmdb_search tv "$search_title" 2>/dev/null)
+    else
+        search_result=$(tmdb_search movie "$search_title" "$year" 2>/dev/null)
+    fi
+
+    if [[ -z "$search_result" ]]; then
+        echo "   ⚠️  TMDB: sem resultado para \"$search_title\""
+        return 1
+    fi
+
+    TMDB_TITLE="${search_result%%|*}"
+    local _rest="${search_result#*|}"
+    TMDB_YEAR="${_rest%%|*}"
+    TMDB_ID="${_rest##*|}"
+    echo "   🎬 TMDB: ${TMDB_TITLE} (${TMDB_YEAR})"
+
+    # 2. Detalhes: overview + gêneros
+    local detail_res genre_res
+    if [[ -n "$season_num" && -n "$episode_num" ]]; then
+        # Episódio: overview no endpoint do ep, gêneros no endpoint da série
+        detail_res=$(tmdb_curl \
+            "https://api.themoviedb.org/3/tv/${TMDB_ID}/season/${season_num}/episode/${episode_num}")
+        genre_res=$(tmdb_curl "https://api.themoviedb.org/3/tv/${TMDB_ID}")
+    else
+        detail_res=$(tmdb_curl "https://api.themoviedb.org/3/movie/${TMDB_ID}")
+        genre_res="$detail_res"
+    fi
+
+    # Overview (escapa \n, \r do JSON)
+    [[ -n "$detail_res" ]] && TMDB_OVERVIEW=$(printf '%s' "$detail_res" \
+        | grep -o '"overview":"[^"]*"' | head -1 \
+        | sed 's/^"overview":"//;s/"$//;s/\\n/ /g;s/\\r//g')
+
+    # Gêneros: extrai array genres[].name
+    if [[ -n "$genre_res" ]]; then
+        local genres_block
+        genres_block=$(printf '%s' "$genre_res" | grep -o '"genres":\[[^]]*\]' | head -1)
+        TMDB_GENRES=$(printf '%s' "$genres_block" \
+            | grep -o '"name":"[^"]*"' \
+            | sed 's/^"name":"//;s/"$//' \
+            | paste -sd ',' -)
+    fi
+
+    [[ -n "$TMDB_OVERVIEW" ]] && echo "   📝 ${TMDB_OVERVIEW:0:90}..."
+    [[ -n "$TMDB_GENRES" ]]   && echo "   🏷️  Gêneros: ${TMDB_GENRES}"
+
+    # 3. Monta array -metadata para ffmpeg
+    [[ -n "$TMDB_TITLE" ]]    && TMDB_META_ARGS+=("-metadata" "title=${TMDB_TITLE}")
+    [[ -n "$TMDB_YEAR" ]]     && TMDB_META_ARGS+=("-metadata" "date=${TMDB_YEAR}")
+    [[ -n "$TMDB_OVERVIEW" ]] && TMDB_META_ARGS+=("-metadata" "comment=${TMDB_OVERVIEW}")
+    [[ -n "$TMDB_GENRES" ]]   && TMDB_META_ARGS+=("-metadata" "genre=${TMDB_GENRES}")
 }
 
 # --- Função: converte .srt para UTF-8 via iconv ---
@@ -303,20 +395,20 @@ normalize_srt_encoding() {
 # Filmes:  output/Título (Ano)/Título (Ano).mkv
 # Séries:  output/Título/Season XX/arquivo.mkv
 #
-# Com --tmdb-key: título oficial via API TMDB
-# Sem --tmdb-key: título do metadado embutido, com fallback para parse do filename
+# Usa TMDB_TITLE/TMDB_YEAR dos globals pré-buscados por resolve_tmdb_for_file().
+# Parâmetro $3="true": embute TMDB_META_ARGS via ffmpeg -c copy (usado em --organize-only).
+# Parâmetro $3 ausente/false: simples mv (arquivo já tem metadados do encode).
 organize_output() {
-    local file="$1" src_name="$2"
+    local file="$1" src_name="$2" embed_meta="${3:-false}"
 
-    # --- Detecta série vs filme pelo padrão SxxExx ---
+    # --- Detecta série vs filme ---
     local season_num=""
     [[ "$src_name" =~ [Ss]([0-9]{2})[Ee]([0-9]{2}) ]] && season_num="${BASH_REMATCH[1]}"
 
-    # --- Extrai ano do filename ---
     local year=""
     [[ "$src_name" =~ (19[0-9]{2}|20[0-9]{2}) ]] && year="${BASH_REMATCH[1]}"
 
-    # --- "Título base" para busca: tudo antes do SxxExx ou do ano, sem tags de qualidade ---
+    # --- Título base do filename (fallback) ---
     local parsed="${src_name%.*}"; parsed="${parsed//./ }"
     local search_title
     if [[ -n "$season_num" ]]; then
@@ -329,31 +421,12 @@ organize_output() {
     fi
     search_title="${search_title## }"; search_title="${search_title%% }"
 
-    local final_title="" final_year="$year"
+    # Usa TMDB globals pré-buscados (resolve_tmdb_for_file já foi chamada no loop)
+    # Fallback para parse limpo do filename se TMDB não trouxe resultado.
+    local final_title="${TMDB_TITLE:-$search_title}"
+    local final_year="${TMDB_YEAR:-$year}"
 
-    # --- 1. TMDB (título oficial via API) ---
-    if [[ -n "$TMDB_KEY" ]]; then
-        local tmdb_result
-        if [[ -n "$season_num" ]]; then
-            tmdb_result=$(tmdb_search tv "$search_title" 2>/dev/null)
-        else
-            tmdb_result=$(tmdb_search movie "$search_title" "$year" 2>/dev/null)
-        fi
-        if [[ -n "$tmdb_result" ]]; then
-            final_title="${tmdb_result%%|*}"
-            local tmdb_year="${tmdb_result##*|}"
-            [[ -n "$tmdb_year" ]] && final_year="$tmdb_year"
-            echo "   🎬 TMDB: $final_title ($final_year)"
-        else
-            echo "   ⚠️  TMDB não encontrou resultado para \"$search_title\" — usando parse do filename"
-        fi
-    fi
-
-    # --- 2. Parse limpo do filename (fallback sem TMDB) ---
-    # Não usa metadados do arquivo: o título embutido pelo source costuma ter lixo de release group.
-    [[ -z "$final_title" ]] && final_title="$search_title"
-
-    # Sanitiza para uso em nome de pasta
+    # Sanitiza para nome de pasta
     local safe_title
     safe_title=$(printf '%s' "$final_title" | LC_ALL=C sed 's|[/:*?"<>|\\]||g' | LC_ALL=C sed 's/  */ /g')
     safe_title="${safe_title## }"; safe_title="${safe_title%% }"
@@ -372,7 +445,23 @@ organize_output() {
     fi
 
     mkdir -p "$dest_dir"
-    mv "$file" "${dest_dir}/${dest_file}"
+
+    # --organize-only com TMDB: embute metadados via ffmpeg -c copy antes de mover.
+    # Encode normal / sub-only: metadados já foram embutidos pelo ffmpeg — simples mv.
+    if [[ "$embed_meta" == true && ${#TMDB_META_ARGS[@]} -gt 0 ]]; then
+        echo "📝 Embutindo metadados TMDB..."
+        if ffmpeg -loglevel error \
+            -i "$file" -c copy "${TMDB_META_ARGS[@]}" \
+            -y "${dest_dir}/${dest_file}" 2>&1; then
+            [[ "$file" != "${dest_dir}/${dest_file}" ]] && rm -f "$file"
+        else
+            echo "⚠️  ffmpeg falhou ao embutir metadados — movendo sem metadados"
+            mv "$file" "${dest_dir}/${dest_file}"
+        fi
+    else
+        mv "$file" "${dest_dir}/${dest_file}"
+    fi
+
     echo "   ✓ ${dest_dir}/${dest_file}"
 }
 
@@ -410,9 +499,16 @@ for input in "${FILES[@]}"; do
     # Metadado de título (opcional)
     title_arg=()
 
-    # --- MODO ORGANIZE-ONLY: organiza o próprio arquivo de entrada ---
+    # Reset e resolve metadados TMDB (quando --organize e TMDB_KEY disponível)
+    TMDB_TITLE="" TMDB_YEAR="" TMDB_ID="" TMDB_OVERVIEW="" TMDB_GENRES=""
+    TMDB_META_ARGS=()
+    if [[ "$ORGANIZE" == true && -n "$TMDB_KEY" ]]; then
+        resolve_tmdb_for_file "$(basename "$input")"
+    fi
+
+    # --- MODO ORGANIZE-ONLY: organiza (e embute metadados se TMDB disponível) ---
     if [[ "$ORGANIZE_ONLY" == true ]]; then
-        organize_output "$input" "$(basename "$input")"
+        organize_output "$input" "$(basename "$input")" true
         COMPLETED_FILES+=("$input")
         ((CURRENT_FILE++))
         continue
@@ -523,6 +619,7 @@ for input in "${FILES[@]}"; do
             -map 0:v "${sub_audio_map[@]}" "${sub_embedded_map[@]}" -map 1:s:0 \
             -c copy -c:s copy \
             "${title_arg[@]}" \
+            "${TMDB_META_ARGS[@]}" \
             -y "$output" 2>&1
 
         FFMPEG_EXIT=$?
@@ -678,6 +775,7 @@ for input in "${FILES[@]}"; do
         -c:a copy \
         -c:s copy \
         "${title_arg[@]}" \
+        "${TMDB_META_ARGS[@]}" \
         -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
     
     FFMPEG_PID=$!
