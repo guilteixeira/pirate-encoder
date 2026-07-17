@@ -258,20 +258,21 @@ tmdb_search() {
     [[ "$type" == "movie" ]] && url_path="search/movie" || url_path="search/tv"
 
     local response
+
     if [[ ${#TMDB_KEY} -gt 100 ]]; then
-        response=$(curl -sf -G \
-            -H "Authorization: Bearer $TMDB_KEY" \
-            -H "accept: application/json" \
-            --data-urlencode "query=$query" \
-            ${year:+--data-urlencode "year=$year"} \
-            "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
-    else
-        response=$(curl -sf -G \
-            -H "accept: application/json" \
-            --data-urlencode "query=$query" \
-            --data-urlencode "api_key=$TMDB_KEY" \
-            ${year:+--data-urlencode "year=$year"} \
-            "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
+            response=$(curl -sf -G \
+                -H "Authorization: Bearer $TMDB_KEY" \
+                -H "accept: application/json" \
+                --data-urlencode "query=$query" \
+                ${year:+--data-urlencode "primary_release_year=$year"} \
+                "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
+        else
+            response=$(curl -sf -G \
+                -H "accept: application/json" \
+                --data-urlencode "query=$query" \
+                --data-urlencode "api_key=$TMDB_KEY" \
+                ${year:+--data-urlencode "primary_release_year=$year"} \
+                "https://api.themoviedb.org/3/${url_path}" 2>/dev/null)
     fi
     [[ -z "$response" ]] && return 1
 
@@ -280,16 +281,16 @@ tmdb_search() {
         title=$(printf '%s' "$response" | grep -o '"title":"[^"]*"' | head -1 \
             | sed 's/^"title":"//;s/"$//')
         yr=$(printf '%s' "$response" | grep -o '"release_date":"[0-9]\{4\}' | head -1 \
-            | sed 's/^"release_date":"//') 
+            | sed 's/^"release_date":"//')
         id=$(printf '%s' "$response" | grep -o '"id":[0-9]*' | head -1 | sed 's/^"id"://')
-        [[ -n "$title" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
+        [[ -n "$title" && -n "$yr" && -n "$id" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
     else
         title=$(printf '%s' "$response" | grep -o '"name":"[^"]*"' | head -1 \
             | sed 's/^"name":"//;s/"$//')
         yr=$(printf '%s' "$response" | grep -o '"first_air_date":"[0-9]\{4\}' | head -1 \
-            | sed 's/^"first_air_date":"//') 
+            | sed 's/^"first_air_date":"//')
         id=$(printf '%s' "$response" | grep -o '"id":[0-9]*' | head -1 | sed 's/^"id"://')
-        [[ -n "$title" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
+        [[ -n "$title" && -n "$yr" && -n "$id" ]] && printf '%s|%s|%s\n' "$title" "$yr" "$id" && return 0
     fi
     return 1
 }
@@ -344,10 +345,10 @@ resolve_tmdb_for_file() {
     if [[ -n "$season_num" && -n "$episode_num" ]]; then
         # Episódio: overview no endpoint do ep, gêneros no endpoint da série
         detail_res=$(tmdb_curl \
-            "https://api.themoviedb.org/3/tv/${TMDB_ID}/season/${season_num}/episode/${episode_num}")
-        genre_res=$(tmdb_curl "https://api.themoviedb.org/3/tv/${TMDB_ID}")
+            "https://api.themoviedb.org/3/tv/${TMDB_ID}/season/${season_num}/episode/${episode_num}?language=pt-BR")
+        genre_res=$(tmdb_curl "https://api.themoviedb.org/3/tv/${TMDB_ID}?language=pt-BR")
     else
-        detail_res=$(tmdb_curl "https://api.themoviedb.org/3/movie/${TMDB_ID}")
+        detail_res=$(tmdb_curl "https://api.themoviedb.org/3/movie/${TMDB_ID}?language=pt-BR")
         genre_res="$detail_res"
     fi
 
@@ -677,7 +678,7 @@ for input in "${FILES[@]}"; do
     if [ "$COLOR_TRC" == "smpte2084" ]; then
         echo "✨ HDR10 Detectado."
         HDR_OPTS="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
-        
+
         HDR_DATA=$(ffprobe -v error -select_streams v:0 -show_frames -read_intervals "%+#1" -show_entries frame=side_data_list "$input" 2>/dev/null)
         MAX_CLL=$(echo "$HDR_DATA" | grep "max_content_light_level" | sed 's/.*=//' | tr -d '[:space:]')
         MAX_FALL=$(echo "$HDR_DATA" | grep "max_average_light_level" | sed 's/.*=//' | tr -d '[:space:]')
@@ -759,7 +760,7 @@ for input in "${FILES[@]}"; do
 
     # Executa ffmpeg com output redirecionado para arquivo temporário
     FFMPEG_OUTPUT=$(mktemp)
-    
+
     ffmpeg -loglevel error -stats \
         $VAAPI_DEV \
         -i "$input" "${extra_args[@]}" \
@@ -777,33 +778,33 @@ for input in "${FILES[@]}"; do
         "${title_arg[@]}" \
         "${TMDB_META_ARGS[@]}" \
         -y "$output" > "$FFMPEG_OUTPUT" 2>&1 &
-    
+
     FFMPEG_PID=$!
     ENCODE_START_TIME=$(date +%s)
-    
+
     # Monitora o progresso lendo arquivo temporário
     while kill -0 $FFMPEG_PID 2>/dev/null; do
         if [ -f "$FFMPEG_OUTPUT" ]; then
             # Procura pela última linha que contém "time=" em todo o arquivo
             LAST_LINE=$(grep "time=" "$FFMPEG_OUTPUT" 2>/dev/null | tail -1)
-            
+
             if [[ -n "$LAST_LINE" ]]; then
                 # Extrai tempo no formato HH:MM:SS
                 TIME_STR=$(echo "$LAST_LINE" | sed -E 's/.*time=([0-9]{2}:[0-9]{2}:[0-9]{2}).*/\1/')
-                
+
                 if [[ "$TIME_STR" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
                     IFS=: read -r h m s <<< "$TIME_STR"
                     CURRENT_SECONDS=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
-                    
+
                     if [[ -n "$TOTAL_SECONDS" && "$TOTAL_SECONDS" -gt 0 ]]; then
                         PERCENT=$(echo "scale=1; ($CURRENT_SECONDS * 100) / $TOTAL_SECONDS" | bc)
-                        
+
                         # Calcula tempo decorrido
                         CURRENT_TIME=$(date +%s)
                         ELAPSED=$((CURRENT_TIME - ENCODE_START_TIME))
                         ELAPSED_MIN=$((ELAPSED / 60))
                         ELAPSED_SEC=$((ELAPSED % 60))
-                        
+
                         # Extrai frame e fps compatível com macOS e Linux
                         FRAME=$(echo "$LAST_LINE" | sed -E 's/.*frame= *([0-9]+).*/\1/')
                         FPS=$(echo "$LAST_LINE" | sed -E 's/.*fps= *([0-9]+).*/\1/')
@@ -826,11 +827,11 @@ for input in "${FILES[@]}"; do
         fi
         sleep 0.5
     done
-    
+
     # Aguarda o fim do processo
     wait $FFMPEG_PID
     FFMPEG_EXIT=$?
-    
+
     # Limpeza
     rm -f "$FFMPEG_OUTPUT"
     for tmp in "${SUB_TMPS_ENC[@]:-}"; do [[ -f "$tmp" ]] && rm -f "$tmp"; done
