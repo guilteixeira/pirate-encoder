@@ -7,6 +7,8 @@ use std::process::Command;
 pub struct TmdbMeta {
     pub title: Option<String>,
     pub year: Option<String>,
+    // Mantido para uso futuro (ex: embutir tmdb_id nos metadados); não lido hoje.
+    #[allow(dead_code)]
     pub id: Option<i64>,
     pub overview: Option<String>,
     pub genres: Option<String>,

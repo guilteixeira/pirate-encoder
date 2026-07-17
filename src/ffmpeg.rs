@@ -8,7 +8,6 @@ use std::time::Instant;
 
 pub struct MediaInfo {
     pub duration_secs: f64,
-    pub fps: f64,
     pub total_frames: i64,
     pub start_time_ms: i64,
     pub color_transfer: String,
@@ -98,7 +97,6 @@ pub fn probe(input: &Path) -> Result<MediaInfo> {
 
     Ok(MediaInfo {
         duration_secs,
-        fps,
         total_frames,
         start_time_ms,
         color_transfer,
@@ -135,7 +133,6 @@ pub struct EncodeArgs<'a> {
     pub metadata_args: Vec<String>,
     pub output: &'a Path,
     pub total_frames: i64,
-    pub total_secs: f64,
 }
 
 /// Executa o encode usando `-progress pipe:1`, que emite pares key=value

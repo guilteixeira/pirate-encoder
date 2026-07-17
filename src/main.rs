@@ -309,7 +309,6 @@ fn main() -> Result<()> {
             metadata_args: all_meta,
             output: &output,
             total_frames: info.total_frames,
-            total_secs: info.duration_secs,
         };
 
         let ok = ffmpeg::run_encode(&enc_args)?;

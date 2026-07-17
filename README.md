@@ -1,5 +1,7 @@
 # pirate-encoder
 
+Script para encoding amador para agilizar backups e dumps de dvds antigos
+
 ## Build
 
 ```bash
@@ -11,8 +13,6 @@ O binário fica em `target/release/pirate-encoder`. Copie para algum lugar no PA
 (ex: `cp target/release/pirate-encoder /usr/local/bin/`).
 
 ## Uso
-
-Mesma sintaxe do script bash:
 
 ```bash
 ./target/release/pirate-encoder '*.mkv' --tune anime
@@ -26,7 +26,7 @@ buildar antes (cargo builda e roda em um passo só).
 
 ## Dependências
 
-- Runtime: `ffmpeg`, `ffprobe`, `curl` no PATH (mesmas do script original).
+- Runtime: `ffmpeg`, `ffprobe`, `curl` na ultima versão disponível.
 - Build: toolchain Rust estável (`rustup` ou `brew install rust` no macOS).
 
 ## Testes
